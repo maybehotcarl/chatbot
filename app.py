@@ -761,10 +761,8 @@ def handle_new_drops(new_drops, wave_id, jwt_token):
     mentioned_drops = []
     replied_drops = []
     
-    import re
-    mention_pattern = re.compile(rf"(?<!\w)@{re.escape(BOT_HANDLE)}(?!\w)", re.IGNORECASE)
     for drop in new_drops:
-        is_explicit_mention = bool(mention_pattern.search(drop.content or ""))
+        is_explicit_mention = is_bot_mentioned(drop)
 
         if drop.reply_to_id:
             parent_drop = Drop.query.get(drop.reply_to_id)
@@ -950,8 +948,16 @@ def post_general_response(wave_id, bot_response, jwt_token):
 def is_bot_mentioned(drop):
     """
     Checks if your bot is mentioned in the given drop.
+    Handles both @ombot and @[ombot] formats.
     """
-    return BOT_HANDLE in drop.content
+    if not drop.content:
+        return False
+        
+    # Check for both mention formats
+    import re
+    # Handle both formats: @ombot and @[ombot]
+    mention_pattern = re.compile(rf"(?<!\w)@(\[)?{re.escape(BOT_HANDLE)}(\])?(?!\w)", re.IGNORECASE)
+    return bool(mention_pattern.search(drop.content))
 
 def respond_to_drop(drop, wave_id):
     """
@@ -1420,8 +1426,7 @@ def check_for_unhandled_interactions(wave_id, jwt_token):
     print("Checking for any unhandled interactions from previous sessions...")
     
     # Find drops that mention the bot but haven't been replied to yet
-    import re
-    mention_pattern = re.compile(rf"(?<!\w)@{re.escape(BOT_HANDLE)}(?!\w)", re.IGNORECASE)
+    # Using the is_bot_mentioned function that handles both @ombot and @[ombot] formats
     
     # Query for recent drops to check for mentions and replies
     recent_drops = Drop.query.filter_by(wave_id=wave_id).order_by(Drop.created_at.desc()).limit(100).all()
@@ -1430,7 +1435,7 @@ def check_for_unhandled_interactions(wave_id, jwt_token):
     # Filter for unhandled mentions
     unhandled_mentions = []
     for drop in recent_drops:
-        is_explicit_mention = bool(mention_pattern.search(drop.content or ""))
+        is_explicit_mention = is_bot_mentioned(drop)
         if is_explicit_mention and not getattr(drop, 'bot_replied_to', False):
             unhandled_mentions.append(drop)
             print(f"  Added drop {drop.serial_no} as unhandled mention")
