@@ -18,10 +18,12 @@ from requests.exceptions import HTTPError
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
-# Initialize the scheduler
-scheduler = BackgroundScheduler()
 import hashlib
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+import functools
+
+# Initialize the scheduler
+scheduler = BackgroundScheduler()
 
 # Load environment variables
 load_dotenv()
@@ -285,6 +287,36 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(app)
 migrate = Migrate(app, db)
 
+# Retry decorator for API calls
+def retry_api_call(max_retries=3, backoff_factor=1.5, retry_on_exceptions=(requests.exceptions.RequestException,)):
+    """
+    Retry decorator for API calls that might fail temporarily.
+    
+    Args:
+        max_retries: Maximum number of retries
+        backoff_factor: Backoff factor for exponential delay between retries
+        retry_on_exceptions: Tuple of exceptions that should trigger a retry
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            retries = 0
+            while retries <= max_retries:
+                try:
+                    return func(*args, **kwargs)
+                except retry_on_exceptions as e:
+                    retries += 1
+                    if retries > max_retries:
+                        # Only log final failure
+                        raise
+                    
+                    # Calculate backoff delay with exponential backoff
+                    delay = backoff_factor ** retries
+                    print(f"Retrying API call ({retries}/{max_retries})")
+                    time.sleep(delay)
+        return wrapper
+    return decorator
+
 # Set up migrations to work with SQLite's limitations
 with app.app_context():
     if not os.environ.get("FLASK_NO_CREATE_DB"):
@@ -430,9 +462,6 @@ def fetch_new_drops_for_wave(wave_id, jwt_token):
         # Debug - check if any drops have serial > local_max_serial
         new_serials_count = sum(1 for drop in drops_list if drop.get("serial_no", 0) > local_max_serial)
         print(f"API returned {len(drops_list)} drops, {new_serials_count} with serial > {local_max_serial}")
-        if new_serials_count == 0:
-            print("⚠️ API returned no drops with newer serials than what we have locally")
-            print(f"API parameters used: {params}")
         
         # Debug - print serial numbers from the response to see what's returned
         serials = [drop.get("serial_no", 0) for drop in drops_list]
@@ -708,27 +737,20 @@ def process_specific_drops(wave_id, serial_numbers, jwt_token):
                         print(f"Response generation failed for drop {drop_to_respond_to.serial_no}")
                         continue
                     
-                    # Post the response as a reply to this specific drop
-                    payload = {
-                        "wave_id": wave_id,
-                        "drop_type": "CHAT",
-                        "parts": [{"content": bot_response}],
-                        "reply_to": {"drop_id": drop_to_respond_to.id, "drop_part_id": 0},
-                    }
-                    
-                    url = f"{BASE_URL}/drops"
-                    headers = {
-                        "Authorization": f"Bearer {jwt_token}",
-                        "Content-Type": "application/json",
-                    }
-                    
+                    # Post the response as a reply to this specific drop using retry mechanism
                     try:
-                        response = requests.post(url, headers=headers, json=payload)
-                        response.raise_for_status()
+                        post_response_with_retry(
+                            wave_id=wave_id,
+                            content=bot_response,
+                            jwt_token=jwt_token,
+                            reply_to_id=drop_to_respond_to.id,
+                            reply_to_part_id=0
+                        )
                         responses_count += 1
                         print(f"Response posted as a reply to drop {drop_to_respond_to.serial_no}!")
                     except Exception as e:
-                        print(f"Error posting response to drop {drop_to_respond_to.serial_no}: {e}")
+                        # Error already printed below
+                        print(f"Error posting response to drop {drop_to_respond_to.serial_no} after retries: {e}")
                 
                 general_response_posted = responses_count > 0
                 print(f"Posted {responses_count} individual responses to drops")
@@ -834,26 +856,22 @@ def monitor_memes_chat(jwt_token=None):
                         print(f"Response generation failed for drop {drop_to_respond_to.serial_no}")
                         continue
                     
-                    # Post the response as a reply to this specific drop
-                    payload = {
-                        "wave_id": wave_id,
-                        "drop_type": "CHAT",
-                        "parts": [{"content": bot_response}],
-                        "reply_to": {"drop_id": drop_to_respond_to.id, "drop_part_id": 0},
-                    }
-                    
-                    url = f"{BASE_URL}/drops"
-                    headers = {
-                        "Authorization": f"Bearer {jwt_token}",
-                        "Content-Type": "application/json",
-                    }
-                    
-                    response = requests.post(url, headers=headers, json=payload)
-                    response.raise_for_status()
-                    responses_count += 1
-                    print(f"Response posted as a reply to drop {drop_to_respond_to.serial_no}!")
+                    # Post the response as a reply to this specific drop using retry mechanism
+                    try:
+                        post_response_with_retry(
+                            wave_id=wave_id,
+                            content=bot_response,
+                            jwt_token=jwt_token,
+                            reply_to_id=drop_to_respond_to.id,
+                            reply_to_part_id=0
+                        )
+                        responses_count += 1
+                        print(f"Response posted as a reply to drop {drop_to_respond_to.serial_no}!")
+                    except Exception as e:
+                        # Error already printed below
+                        print(f"Error posting response to drop {drop_to_respond_to.serial_no} after retries: {e}")
                 except Exception as e:
-                    print(f"Error posting response to drop {drop_to_respond_to.serial_no}: {e}")
+                    print(f"Error generating response for drop {drop_to_respond_to.serial_no}: {e}")
             
             general_response_posted = responses_count > 0
             print(f"Posted {responses_count} individual responses to drops")
@@ -899,18 +917,35 @@ def handle_new_drops(new_drops, wave_id, jwt_token):
         # Only reply to the 2 most recent unhandled mentions
         unhandled_mentions = [drop for drop in mentioned_drops if not getattr(drop, 'bot_replied_to', False)]
         # Sort by created_at desc, then serial_no desc as fallback
-        unhandled_mentions.sort(key=lambda d: (d.created_at or datetime.min, d.serial_no), reverse=True)
-        for drop in unhandled_mentions[:2]:
-            print(f"Generating reply to mention in drop {drop.serial_no}...")
-            try:
-                reply_to_mention(drop, jwt_token)
-                drop.bot_replied_to = True
-                db.session.commit()
-            except Exception as e:
-                db.session.rollback()
-                print(f"Error replying to mention or updating DB for drop {drop.serial_no}: {e}")
-        if len(unhandled_mentions) > 2:
-            print(f"Skipped {len(unhandled_mentions) - 2} older unhandled mentions to avoid spamming.")
+        # Process mentions first - limit to 2 most recent
+        if mentioned_drops:
+            # Only reply to the 2 most recent unhandled mentions
+            unhandled_mentions = [drop for drop in mentioned_drops if not getattr(drop, 'bot_replied_to', False)]
+            # Sort by created_at desc, then serial_no desc as fallback
+            unhandled_mentions.sort(key=lambda d: (d.created_at or datetime.min, d.serial_no), reverse=True)
+            # Limit to 2
+            mentions_to_process = unhandled_mentions[:2]
+            
+            print(f"Processing {len(mentions_to_process)} new mentions")
+            for drop in mentions_to_process:
+                print(f"Generating reply to mention in drop {drop.serial_no}...")
+                try:
+                    reply_result = reply_to_mention(drop, jwt_token)
+                    if reply_result:
+                        # Only mark as replied to after successful API call
+                        drop.bot_replied_to = True
+                        db.session.commit()
+                        print(f"Drop {drop.serial_no} marked as replied to after successful API call")
+                        mentions_count += 1
+                    else:
+                        print(f"Failed to reply to drop {drop.serial_no}, not marking as replied to")
+                except Exception as e:
+                    db.session.rollback()
+                    print(f"Error replying to mention or updating DB for drop {drop.serial_no}: {e}")
+                    
+            # Log if we skipped any mentions
+            if len(unhandled_mentions) > 2:
+                print(f"Skipped {len(unhandled_mentions) - 2} older unhandled mentions to avoid spamming.")
         for drop in mentioned_drops:
             if getattr(drop, 'bot_replied_to', False):
                 print(f"Already replied to mention in drop {drop.serial_no}, skipping.")
@@ -927,9 +962,12 @@ def handle_new_drops(new_drops, wave_id, jwt_token):
         for drop in unhandled_replies[:2]:
             print(f"Generating reply to direct reply in drop {drop.serial_no}...")
             try:
-                reply_to_mention(drop, jwt_token)
-                drop.bot_replied_to = True
-                db.session.commit()
+                # reply_to_mention now returns True on success
+                if reply_to_mention(drop, jwt_token):
+                    # Only mark as replied to after successful API call
+                    drop.bot_replied_to = True
+                    db.session.commit()
+                    print(f"Drop {drop.serial_no} marked as replied to after successful API call")
             except Exception as e:
                 db.session.rollback()
                 print(f"Error replying to direct reply or updating DB for drop {drop.serial_no}: {e}")
@@ -944,8 +982,8 @@ def handle_new_drops(new_drops, wave_id, jwt_token):
 def reply_to_mention(drop, jwt_token):
     """
     Generates and posts a response directly to a drop mentioning the bot.
-    Exceptions are allowed to propagate so that errors are caught in the caller,
-    preventing the drop from being marked as processed if the response fails.
+    Returns True if the response was successfully posted or if the drop doesn't exist.
+    Returns False if there was an error that should prevent marking the drop as processed.
     """
     prompt = f"""
     You were mentioned in the following post:
@@ -958,24 +996,32 @@ def reply_to_mention(drop, jwt_token):
     response = client.responses.create(**params)
     bot_response = response.output_text  # Simplified access to response text
 
-    # Prepare the payload for posting the reply
-    payload = {
-        "wave_id": drop.wave_id,
-        "drop_type": "CHAT",
-        "parts": [{"content": bot_response}],
-        "reply_to": {"drop_id": drop.id, "drop_part_id": 0},  # Reply to the specific drop
-    }
-
-    url = f"{BASE_URL}/drops"
-    headers = {
-        "Authorization": f"Bearer {jwt_token}",
-        "Content-Type": "application/json",
-    }
-
-    # Post the reply; if this fails, an exception is raised
-    response = requests.post(url, headers=headers, json=payload)
-    response.raise_for_status()
-    print(f"Successfully replied to mention in drop {drop.serial_no}.")
+    # Try to post as a direct reply
+    try:
+        post_response_with_retry(
+            wave_id=drop.wave_id,
+            content=bot_response,
+            jwt_token=jwt_token,
+            reply_to_id=drop.id,
+            reply_to_part_id=0
+        )
+        print(f"Successfully replied to mention in drop {drop.serial_no}.")
+        return True
+    except requests.exceptions.HTTPError as e:
+        # Handle case where drop doesn't exist in the API
+        error_detail = ""
+        try:
+            error_detail = e.response.json()
+        except:
+            error_detail = e.response.text if hasattr(e.response, 'text') else ""
+        
+        # If the error is about an invalid drop ID, consider it successfully handled
+        if "doesn't exist" in str(error_detail) or "Invalid reply" in str(error_detail):
+            print(f"Drop {drop.serial_no} doesn't exist in API, marking as handled.")
+            return True
+        else:
+            # For other errors, propagate the exception
+            raise e
 
 def get_last_50_drops(wave_id):
     """
@@ -1039,31 +1085,57 @@ def fetch_user_by_handle(jwt_token, handle, wave_id=None):
     except requests.exceptions.RequestException as e:
         print(f"Could not fetch profile for @{handle}: {e}")
         return None
-
     
-def post_general_response(wave_id, bot_response, jwt_token):
-    """
-    Posts the bot's response to the wave without replying to a specific drop.
-    Exceptions are allowed to propagate so that errors are caught in the caller.
-    """
-    if not bot_response:
-        raise Exception("No response generated. Skipping post.")
-
+    
+@retry_api_call(max_retries=3, backoff_factor=1.5)
+def post_response_with_retry(wave_id, content, jwt_token, reply_to_id=None, reply_to_part_id=0):
+    """Post a response to the wave with retry capability"""
+    # Construct payload with only the required fields
     payload = {
         "wave_id": wave_id,
         "drop_type": "CHAT",
-        "parts": [{"content": bot_response}],
+        "parts": [
+            {
+                "content": content
+            }
+        ]
     }
-
+    
+    # Add reply_to information if provided
+    if reply_to_id:
+        payload["reply_to"] = {
+            "drop_id": reply_to_id,
+            "drop_part_id": reply_to_part_id
+        }
+        print(f"Posting reply to drop {reply_to_id}")
+    else:
+        print("Posting new message")
+    
     url = f"{BASE_URL}/drops"
     headers = {
         "Authorization": f"Bearer {jwt_token}",
         "Content-Type": "application/json",
     }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.HTTPError as e:
+        # Try to get more detailed error information
+        error_detail = ""
+        try:
+            error_detail = e.response.json()
+        except:
+            error_detail = e.response.text if hasattr(e.response, 'text') else "No error details available"
+        
+        print(f"HTTP Error: {e}")
+        print(f"Error details: {error_detail}")
+        raise
 
-    response = requests.post(url, headers=headers, json=payload)
-    response.raise_for_status()
-    print("Successfully posted the bot's general response to the wave.")
+def post_general_response(wave_id, content, jwt_token):
+    """Post a general response to the wave (legacy function, uses post_response_with_retry)"""
+    return post_response_with_retry(wave_id, content, jwt_token)
 
 def is_bot_mentioned(drop):
     """
@@ -1585,18 +1657,30 @@ def check_for_unhandled_interactions(wave_id, jwt_token):
     unhandled_replies.sort(key=lambda d: (d.created_at or datetime.min, d.serial_no), reverse=True)
     
     # Process up to 2 most recent unhandled mentions
-    mentions_count = len(unhandled_mentions[:2])
-    if mentions_count > 0:
-        print(f"Processing {mentions_count} unhandled mentions from previous sessions")
-        for drop in unhandled_mentions[:2]:
+    mentions_count = 0
+    if unhandled_mentions:
+        # Limit to 2 most recent mentions
+        mentions_to_process = unhandled_mentions[:2]
+        print(f"Processing {len(mentions_to_process)} unhandled mentions from previous sessions")
+        for drop in mentions_to_process:
             print(f"Generating reply to previously unhandled mention in drop {drop.serial_no}...")
             try:
-                reply_to_mention(drop, jwt_token)
-                drop.bot_replied_to = True
-                db.session.commit()
+                reply_result = reply_to_mention(drop, jwt_token)
+                if reply_result:
+                    # Only mark as replied to after successful API call
+                    drop.bot_replied_to = True
+                    db.session.commit()
+                    print(f"Drop {drop.serial_no} marked as replied to after successful API call")
+                    mentions_count += 1
+                else:
+                    print(f"Failed to reply to drop {drop.serial_no}, not marking as replied to")
             except Exception as e:
                 db.session.rollback()
                 print(f"Error replying to mention or updating DB for drop {drop.serial_no}: {e}")
+        
+        # Log if we skipped any mentions
+        if len(unhandled_mentions) > 2:
+            print(f"Skipped {len(unhandled_mentions) - 2} older unhandled mentions to avoid spamming.")
     else:
         print("No unhandled mentions found from previous sessions.")
     
@@ -1607,9 +1691,12 @@ def check_for_unhandled_interactions(wave_id, jwt_token):
         for drop in unhandled_replies[:2]:
             print(f"Generating reply to previously unhandled direct reply in drop {drop.serial_no}...")
             try:
-                reply_to_mention(drop, jwt_token)
-                drop.bot_replied_to = True
-                db.session.commit()
+                # reply_to_mention now returns True on success
+                if reply_to_mention(drop, jwt_token):
+                    # Only mark as replied to after successful API call
+                    drop.bot_replied_to = True
+                    db.session.commit()
+                    print(f"Drop {drop.serial_no} marked as replied to after successful API call")
             except Exception as e:
                 db.session.rollback()
                 print(f"Error replying to direct reply or updating DB for drop {drop.serial_no}: {e}")
