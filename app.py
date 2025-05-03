@@ -477,18 +477,24 @@ def fetch_new_drops_for_wave(wave_id, jwt_token):
             # If there's a parent drop reference but we don't have it, create a stub
             with db.session.no_autoflush:
                 if reply_to_id and not Drop.query.get(reply_to_id):
-                    stubs_created += 1
-                    stub_drop = Drop(
-                        id=reply_to_id,
-                        wave_id=drop_data["wave"]["id"],
-                        author="Unknown",
-                        content="(Stub parent record, to be updated later)",
-                        serial_no=0,
-                        created_at=None,
-                    )
-                    # Check for dictionaries before adding
-                    check_object_for_dicts(stub_drop, f"StubDrop-{reply_to_id}")
-                    db.session.add(stub_drop)
+                    # Check if we've already created this stub in the current session
+                    existing_stub = next((obj for obj in db.session.new 
+                                        if isinstance(obj, Drop) and obj.id == reply_to_id), None)
+                    if not existing_stub:
+                        stubs_created += 1
+                        stub_drop = Drop(
+                            id=reply_to_id,
+                            wave_id=drop_data["wave"]["id"],
+                            author="Unknown",
+                            content="(Stub parent record, to be updated later)",
+                            serial_no=0,
+                            created_at=None,
+                        )
+                        # Check for dictionaries before adding
+                        check_object_for_dicts(stub_drop, f"StubDrop-{reply_to_id}")
+                        db.session.add(stub_drop)
+                    else:
+                        print(f"Skipping duplicate stub creation for ID: {reply_to_id}")
 
             # Handle nested replies (replies to replies)
             nested_parent_drop = reply_to.get("drop", None)
@@ -499,18 +505,24 @@ def fetch_new_drops_for_wave(wave_id, jwt_token):
                     reply_to_id = nested_reply_to_id
                 with db.session.no_autoflush:
                     if nested_reply_to_id and not Drop.query.get(nested_reply_to_id):
-                        stubs_created += 1
-                        stub_drop = Drop(
-                            id=nested_reply_to_id,
-                            wave_id=drop_data["wave"]["id"],
-                            author="Unknown",
-                            content="(Stub parent record, to be updated later)",
-                            serial_no=0,
-                            created_at=None,
-                        )
-                        # Check for dictionaries before adding
-                        check_object_for_dicts(stub_drop, f"StubDrop-{nested_reply_to_id}")
-                        db.session.add(stub_drop)
+                        # Check if we've already created this stub in the current session
+                        existing_stub = next((obj for obj in db.session.new 
+                                            if isinstance(obj, Drop) and obj.id == nested_reply_to_id), None)
+                        if not existing_stub:
+                            stubs_created += 1
+                            stub_drop = Drop(
+                                id=nested_reply_to_id,
+                                wave_id=drop_data["wave"]["id"],
+                                author="Unknown",
+                                content="(Stub parent record, to be updated later)",
+                                serial_no=0,
+                                created_at=None,
+                            )
+                            # Check for dictionaries before adding
+                            check_object_for_dicts(stub_drop, f"StubDrop-{nested_reply_to_id}")
+                            db.session.add(stub_drop)
+                        else:
+                            print(f"Skipping duplicate nested stub creation for ID: {nested_reply_to_id}")
             # --- End processing reply logic ---
 
             # 6. Process basic drop fields
@@ -573,11 +585,17 @@ def fetch_new_drops_for_wave(wave_id, jwt_token):
                 created_at=created_at,
                 reply_to_id=reply_to_id,  # Link to parent drop (if any)
             )
-            # Check for dictionaries before adding
-            check_object_for_dicts(new_drop, f"Drop-{drop_id}")
-            db.session.add(new_drop)
-            drops_added += 1
-            new_drops_found = True
+            # Check if we've already created this drop in the current session
+            existing_drop_in_session = next((obj for obj in db.session.new 
+                                        if isinstance(obj, Drop) and obj.id == drop_id), None)
+            if not existing_drop_in_session:
+                # Check for dictionaries before adding
+                check_object_for_dicts(new_drop, f"Drop-{drop_id}")
+                db.session.add(new_drop)
+                drops_added += 1
+                new_drops_found = True
+            else:
+                print(f"Skipping duplicate drop creation for ID: {drop_id}")
 
         # 8. Commit all new drops & stubs to the DB
         if new_drops_found:
@@ -648,19 +666,72 @@ def process_specific_drops(wave_id, serial_numbers, jwt_token):
         wave_tracking.accumulated_new_drops += len(specific_drops)
         print(f"Accumulated new drops: {wave_tracking.accumulated_new_drops}/{GENERAL_RESPONSE_THRESHOLD}")
         
-        # Only generate a general response if the accumulated count exceeds threshold
+        # Only generate responses if the accumulated count exceeds threshold
         general_response_posted = False
         if wave_tracking.accumulated_new_drops >= GENERAL_RESPONSE_THRESHOLD:
             wave_tracking.accumulated_new_drops = 0
-            drops_text = "\n".join([f"{drop.author}: {drop.content}" for drop in specific_drops])
-            print("Generating a general response to the wave...")
-            bot_response = generate_general_response(drops_text)
-            if bot_response is None:
-                print("General response generation failed.")
-            else:
-                post_general_response(wave_id, bot_response, jwt_token)
-                general_response_posted = True
-                print("General response posted!")
+            
+            # Get drops that aren't from the bot itself
+            non_bot_drops = [drop for drop in specific_drops if drop.author.lower() != BOT_HANDLE.lower()]
+            
+            if non_bot_drops:
+                # Sort by serial number (descending) to get the most recent drops
+                sorted_drops = sorted(non_bot_drops, key=lambda d: d.serial_no, reverse=True)
+                
+                # Limit to responding to at most 3 drops to avoid spamming
+                drops_to_respond_to = sorted_drops[:3]
+                
+                # Get all recent drops for context
+                all_recent_drops = sorted(specific_drops, key=lambda d: d.serial_no, reverse=True)[:10]
+                all_drops_text = "\n".join([f"{drop.author}: {drop.content}" for drop in all_recent_drops])
+                
+                responses_count = 0
+                
+                # Generate individual responses for each drop
+                for drop_to_respond_to in drops_to_respond_to:
+                    print(f"Generating a response to drop {drop_to_respond_to.serial_no} by {drop_to_respond_to.author}...")
+                    
+                    # Create a context that includes the specific drop being responded to
+                    # and some of the surrounding conversation
+                    context_text = f"""
+                    You are specifically replying to this message: {drop_to_respond_to.author}: {drop_to_respond_to.content}
+                    
+                    Recent conversation context:
+                    {all_drops_text}
+                    
+                    REMEMBER: You are specifically writing a reply to this message: {drop_to_respond_to.author}: {drop_to_respond_to.content}
+                    """
+                    
+                    bot_response = generate_general_response(context_text)
+                    
+                    if bot_response is None:
+                        print(f"Response generation failed for drop {drop_to_respond_to.serial_no}")
+                        continue
+                    
+                    # Post the response as a reply to this specific drop
+                    payload = {
+                        "wave_id": wave_id,
+                        "drop_type": "CHAT",
+                        "parts": [{"content": bot_response}],
+                        "reply_to": {"drop_id": drop_to_respond_to.id, "drop_part_id": 0},
+                    }
+                    
+                    url = f"{BASE_URL}/drops"
+                    headers = {
+                        "Authorization": f"Bearer {jwt_token}",
+                        "Content-Type": "application/json",
+                    }
+                    
+                    try:
+                        response = requests.post(url, headers=headers, json=payload)
+                        response.raise_for_status()
+                        responses_count += 1
+                        print(f"Response posted as a reply to drop {drop_to_respond_to.serial_no}!")
+                    except Exception as e:
+                        print(f"Error posting response to drop {drop_to_respond_to.serial_no}: {e}")
+                
+                general_response_posted = responses_count > 0
+                print(f"Posted {responses_count} individual responses to drops")
         
         try:
             # Save the accumulated count
@@ -727,18 +798,65 @@ def monitor_memes_chat(jwt_token=None):
     wave_tracking.accumulated_new_drops += drop_count
     print(f"Accumulated new drops: {wave_tracking.accumulated_new_drops}/{GENERAL_RESPONSE_THRESHOLD}")
 
-    # Only generate a general response if the accumulated count exceeds threshold
+    # Only generate responses if the accumulated count exceeds threshold
     general_response_posted = False
     if wave_tracking.accumulated_new_drops >= GENERAL_RESPONSE_THRESHOLD:
         wave_tracking.accumulated_new_drops = 0
-        drops_text = "\n".join([f"{drop.author}: {drop.content}" for drop in new_drops])
-        print("Generating a general response to the wave...")
-        bot_response = generate_general_response(drops_text)
-        if bot_response is None:
-            raise Exception("General response generation failed.")
-        post_general_response(wave_id, bot_response, jwt_token)
-        general_response_posted = True
-        print("General response posted!")
+        
+        # Get drops that aren't from the bot itself
+        non_bot_drops = [drop for drop in new_drops if drop.author.lower() != BOT_HANDLE.lower()]
+        
+        if non_bot_drops:
+            # Sort by serial number (descending) to get the most recent drops
+            sorted_drops = sorted(non_bot_drops, key=lambda d: d.serial_no, reverse=True)
+            
+            # Limit to responding to at most 3 drops to avoid spamming
+            drops_to_respond_to = sorted_drops[:3]
+            
+            # Get all recent drops for context
+            all_recent_drops = sorted(new_drops, key=lambda d: d.serial_no, reverse=True)[:10]
+            all_drops_text = "\n".join([f"{drop.author}: {drop.content}" for drop in all_recent_drops])
+            
+            responses_count = 0
+            
+            # Generate individual responses for each drop
+            for drop_to_respond_to in drops_to_respond_to:
+                print(f"Generating a response to drop {drop_to_respond_to.serial_no} by {drop_to_respond_to.author}...")
+                
+                # Create a context that includes the specific drop being responded to
+                # and some of the surrounding conversation
+                context_text = f"\nYou are specifically replying to this message: {drop_to_respond_to.author}: {drop_to_respond_to.content}\n\nRecent conversation context:\n{all_drops_text}"
+                
+                try:
+                    bot_response = generate_general_response(context_text)
+                    
+                    if bot_response is None:
+                        print(f"Response generation failed for drop {drop_to_respond_to.serial_no}")
+                        continue
+                    
+                    # Post the response as a reply to this specific drop
+                    payload = {
+                        "wave_id": wave_id,
+                        "drop_type": "CHAT",
+                        "parts": [{"content": bot_response}],
+                        "reply_to": {"drop_id": drop_to_respond_to.id, "drop_part_id": 0},
+                    }
+                    
+                    url = f"{BASE_URL}/drops"
+                    headers = {
+                        "Authorization": f"Bearer {jwt_token}",
+                        "Content-Type": "application/json",
+                    }
+                    
+                    response = requests.post(url, headers=headers, json=payload)
+                    response.raise_for_status()
+                    responses_count += 1
+                    print(f"Response posted as a reply to drop {drop_to_respond_to.serial_no}!")
+                except Exception as e:
+                    print(f"Error posting response to drop {drop_to_respond_to.serial_no}: {e}")
+            
+            general_response_posted = responses_count > 0
+            print(f"Posted {responses_count} individual responses to drops")
         
     # Update last interaction serial to the highest serial number from new_drops
     highest_serial_no = max(drop.serial_no for drop in new_drops)
@@ -888,7 +1006,9 @@ def generate_general_response(drops_text):
 
     {drops_text}
 
-    Craft a brief insightful responses.
+    Craft a single brief, insightful response that contributes to the conversation.
+    Do NOT prefix your response with your name or any labels.
+    Just write the response directly as if you're speaking in the chat.
     """
     params = create_openai_params("gpt-4.1", prompt)
     response = client.responses.create(**params)
@@ -1373,10 +1493,17 @@ def process_drops_batch(drops, wave_id, jwt_token):
             reply_to_id=reply_to_id
         )
         
-        # Check for dictionaries before adding
-        check_object_for_dicts(new_drop, f"Drop-{drop_id}")
-        db.session.add(new_drop)
-        added_count += 1
+        # Check if we've already created this drop in the current session
+        existing_drop_in_session = next((obj for obj in db.session.new 
+                                    if isinstance(obj, Drop) and obj.id == drop_id), None)
+        if not existing_drop_in_session:
+            # Check for dictionaries before adding
+            check_object_for_dicts(new_drop, f"Drop-{drop_id}")
+            db.session.add(new_drop)
+            added_count += 1
+        else:
+            print(f"Skipping duplicate drop creation for ID: {drop_id}")
+            skipped_count += 1
         
         # Commit every 100 records to avoid large transactions
         if added_count % 100 == 0:
