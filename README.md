@@ -45,7 +45,7 @@ This will:
 
 1. Create the SQLite database if it doesn't exist
 2. Connect to the 6529.io API
-3. Set up the chosen wave channel
+3. Set up the chosen wave channel (can take a while for large waves, start in `botsville` for testing)
 4. Start background jobs for fetching new messages and responding to interactions
 
 ## Features
@@ -96,5 +96,5 @@ Database migrations can be managed with:
 
 - **Original Author:** [@maybehotcarl](https://github.com/maybehotcarl)
 - **AI Engineer:** [@brookr](https://github.com/brookr)
-- **Other contributors:**
+- **Other contributors:** Punk 8164, and many tolerant dive bar denizens
 - **AI Assistance:** Significant portions of this project were created and/or refined using AI code tools (including from OpenAI and Anthropic), which contributed to code, documentation, and architectural decisions.

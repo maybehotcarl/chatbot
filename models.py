@@ -31,18 +31,17 @@ class Drop(db.Model):
     serial_no = Column(Integer)
     created_at = Column(DateTime)
     reply_to_id = Column(String, ForeignKey('drop.id'), nullable=True)
-    bot_replied_to_mention = Column(Boolean, default=False)  # Track if bot replied to mention
-    # replies = db.relationship('Drop', backref=db.backref('parent', remote_side=[id]), lazy='dynamic')
+    bot_replied_to = Column(Boolean, default=False)  # Track if bot has replied to this drop (mention or direct reply)
     wave = db.relationship('Wave', backref=db.backref('drops', lazy=True))
     parent = db.relationship('Drop', remote_side=[id], backref='replies', foreign_keys=[reply_to_id])
 
     def __repr__(self):
         return f"<Drop {self.id} by {self.author}>"
 
-# Author model
-class Author(db.Model):
-    __tablename__ = 'authors'
-    id = Column(String, primary_key=True)
+# Identity model (replaces Author model)
+class Identity(db.Model):
+    __tablename__ = 'identities'
+    id = Column(String, primary_key=True)  # API provided id
     handle = Column(String, unique=True, index=True, nullable=False)
     normalized_handle = Column(String, index=True)
     pfp = Column(String)
@@ -56,7 +55,7 @@ class Author(db.Model):
     profile_url = Column(String, nullable=True)
 
     def __repr__(self):
-        return f"<Author {self.handle}>"
+        return f"<Identity {self.handle}>"
 
 class WaveTracking(db.Model):
     __tablename__ = 'wave_tracking'
@@ -69,20 +68,3 @@ class WaveTracking(db.Model):
 
     def __repr__(self):
         return f"<WaveTracking {self.wave_id}>"
-
-class Identity(db.Model):
-    __tablename__ = 'identities'
-    id = db.Column(db.String, primary_key=True)  # API provided id
-    handle = db.Column(db.String, unique=True, index=True, nullable=False)
-    normalised_handle = db.Column(db.String, index=True)
-    pfp = db.Column(db.String)
-    primary_wallet = db.Column(db.String)
-    rep = db.Column(db.Integer)
-    cic = db.Column(db.Integer)
-    level = db.Column(db.Integer)
-    tdh = db.Column(db.Integer)
-    display = db.Column(db.String)
-
-    def __repr__(self):
-        return f"<Identity {self.handle}>"
-    

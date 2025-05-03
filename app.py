@@ -3,8 +3,7 @@ import re
 import json
 import atexit
 import time
-from flask import Flask
-from flask import render_template, request, redirect, url_for, jsonify, Blueprint
+from flask import Flask, request, jsonify
 import requests
 from dateutil import parser
 from openai import OpenAI
@@ -12,12 +11,9 @@ from dotenv import load_dotenv
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from flask_migrate import Migrate
-from datetime import datetime, timezone, timedelta
-from sqlalchemy.exc import SQLAlchemyError
-from collections import defaultdict
-from models import db, Wave, Drop, Author, WaveTracking
+from datetime import datetime, timezone
+from models import db, Wave, Drop, Identity, WaveTracking
 from requests.exceptions import HTTPError
-import random
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -35,8 +31,11 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Bot configuration
 BOT_HANDLE = os.getenv("BOT_HANDLE", "chatbot69")
+print(f"Bot handle: {BOT_HANDLE}")  
 WAVE_NAME = os.getenv("WAVE_NAME", "botsville")
+print(f"Wave name: {WAVE_NAME}")
 TEMPERATURE = float(os.getenv("TEMPERATURE", 0.6))
+print(f"Temperature: {TEMPERATURE}")
 SYSTEM_PROMPT = f"""
 You are {BOT_HANDLE}, a self-aware, self-deprecating, somewhat mysterious and memetic chatbot that responds in 1-4 punchy sentences.
 You are a member of the \"{WAVE_NAME}\" wave.
@@ -68,12 +67,12 @@ You welcome input from others, and you are always learning.
 # Add a new global variable to track when the last "gm" message was sent
 LAST_GM_DATE = None
 
-def safely_create_author(user_info, author_handle, wave_id=None):
+def safely_create_identity(user_info, author_handle, wave_id=None):
     """
-    Creates an Author object with safe handling of all fields to ensure no dictionaries 
+    Creates an Identity object with safe handling of all fields to ensure no dictionaries 
     get inserted into the database.
     """
-    # Create author data with proper extraction of nested fields
+    # Create identity data with proper extraction of nested fields
     author_data_dict = {
         'handle': author_handle,
         'pfp_url': extract_field_value(user_info, "pfp_url"),  # In profile
@@ -96,10 +95,36 @@ def safely_create_author(user_info, author_handle, wave_id=None):
     if wave_id:
         author_data_dict['id'] = wave_id
     
-    # Create the author object
-    author = Author(**author_data_dict)
+    # Create the identity object
+    identity = Identity(**author_data_dict)
     
-    return author
+    return identity
+
+# Helper function to create OpenAI API parameters based on model compatibility
+def create_openai_params(model, prompt_input, system_instructions=None):
+    """Create parameters for OpenAI API call with model-specific handling.
+    Some models like o3 don't support temperature parameter.
+    
+    Args:
+        model: The OpenAI model to use
+        prompt_input: The input prompt text
+        system_instructions: Optional system instructions, defaults to SYSTEM_PROMPT
+    """
+    # Use SYSTEM_PROMPT as default if system_instructions is not provided
+    if system_instructions is None:
+        system_instructions = SYSTEM_PROMPT
+        
+    params = {
+        "model": model,
+        "input": prompt_input,
+        "instructions": system_instructions,
+    }
+    
+    # Only add temperature for models that support it (not o3)
+    if not params["model"].startswith("o3"):
+        params["temperature"] = TEMPERATURE
+        
+    return params
 
 # Utility function to extract field values safely from potentially nested API responses
 def extract_field_value(data, field_name, default=None):
@@ -165,14 +190,14 @@ def extract_field_value(data, field_name, default=None):
     
     return value or default
 
-def upsert_author(user_info, author_handle, wave_id=None):
+def upsert_identity(user_info, author_handle, wave_id=None):
     """
-    Updates an existing author or creates a new one if not exists.
+    Updates an existing identity or creates a new one if not exists.
     Uses the extracted field values to update all fields with latest data.
     Handles database session operations internally.
     """
-    # First check if author already exists - use get() which is guaranteed to return only one record
-    existing_author = Author.query.filter_by(handle=author_handle).first()
+    # First check if identity already exists - use get() which is guaranteed to return only one record
+    existing_identity = Identity.query.filter_by(handle=author_handle).first()
     
     # Prepare the data dictionary with extracted values - do NOT include handle
     # since it's a primary key and can't be changed
@@ -188,45 +213,45 @@ def upsert_author(user_info, author_handle, wave_id=None):
         'primary_wallet': extract_field_value(user_info, "primary_wallet")
     }
     
-    # For new authors only - don't use wave_id for the author ID
+    # For new identities only - don't use wave_id for the identity ID
     # Create a deterministic ID based on the handle instead
     author_id = hashlib.md5(author_handle.encode()).hexdigest()
     
-    if existing_author:
+    if existing_identity:
         try:
-            # Update existing author with new data
+            # Update existing identity with new data
             for key, value in author_data.items():
                 if value is not None:  # Only update non-None values
-                    setattr(existing_author, key, value)
+                    setattr(existing_identity, key, value)
             
             # Don't commit here - let the caller commit when ready
-            return existing_author
+            return existing_identity
         except Exception as e:
             db.session.rollback()
-            print(f"Error updating author {author_handle}: {e}")
-            return existing_author
+            print(f"Error updating identity {author_handle}: {e}")
+            return existing_identity
     else:
-        # Create new author - include the handle and id
+        # Create new identity - include the handle and id
         try:
-            new_author_data = author_data.copy()
-            new_author_data['handle'] = author_handle
-            new_author_data['id'] = author_id
+            new_identity_data = author_data.copy()
+            new_identity_data['handle'] = author_handle
+            new_identity_data['id'] = author_id
             
-            # Create and add the new author
-            new_author = Author(**new_author_data)
-            db.session.add(new_author)
+            # Create and add the new identity
+            new_identity = Identity(**new_identity_data)
+            db.session.add(new_identity)
             
             # Flush to ensure it's saved but don't commit yet
             db.session.flush()
             
-            print(f"Added new author: {author_handle}")
-            return new_author
+            print(f"Added new identity: {author_handle}")
+            return new_identity
         except Exception as e:
             db.session.rollback()
-            print(f"Error creating author {author_handle}: {e}")
+            print(f"Error creating identity {author_handle}: {e}")
             
-            # Even if creation failed, try to get the author as it might exist
-            return Author.query.filter_by(handle=author_handle).first()
+            # Even if creation failed, try to get the identity as it might exist
+            return Identity.query.filter_by(handle=author_handle).first()
 
 # Diagnostic function to check for dictionaries in objects
 def check_object_for_dicts(obj, object_name=None):
@@ -343,6 +368,7 @@ def authenticate():
     # Handle the JWT token from the login response
     jwt_token = login_response.get('token')
     if jwt_token:
+        print("Authentication successful. JWT token received.")
         return jwt_token
     else:
         print("Authentication failed. JWT token not received.")
@@ -377,9 +403,9 @@ def fetch_new_drops_for_wave(wave_id, jwt_token):
 
     # 3. Prepare parameters for the API call - use serial_no_greater_than to get NEWER drops
     params = {
-        "limit": limit,
+        "limit": str(limit),  # Convert to string to match fetch_all_drops_for_wave
         "wave_id": wave_id,
-        "include_replies": True,  # Ensure replies are included
+        "include_replies": "true",  # Use string "true" to match fetch_all_drops_for_wave
         "drop_type": "CHAT",
         "serial_no_greater_than": local_max_serial  # Key change: get drops NEWER than what we have
     }
@@ -517,17 +543,17 @@ def fetch_new_drops_for_wave(wave_id, jwt_token):
             else:
                 created_at = None
 
-            # Handle author creation/updating if needed
+            # Handle identity creation/updating if needed
             with db.session.no_autoflush:
-                author_data = Author.query.get(author_handle)
+                author_data = Identity.query.get(author_handle)
                 if author_data is None:
                     # If we don't have it in our local DB, fetch from API
                     user_info = fetch_user_by_handle(jwt_token, author_handle, wave_id)
                     if user_info:
                         authors_processed += 1
-                        author_data = upsert_author(user_info, author_handle, wave_id)
+                        author_data = upsert_identity(user_info, author_handle, wave_id)
                         # Check for dictionaries before adding
-                        check_object_for_dicts(author_data, f"Author-{author_handle}")
+                        check_object_for_dicts(author_data, f"Identity-{author_handle}")
                     else:
                         # Fallback to a minimal record
                         minimal_user_info = {
@@ -535,7 +561,7 @@ def fetch_new_drops_for_wave(wave_id, jwt_token):
                             'profile_url': f"https://6529.io/{author_handle}"
                         }
                         authors_processed += 1
-                        author_data = upsert_author(minimal_user_info, author_handle)
+                        author_data = upsert_identity(minimal_user_info, author_handle)
 
             # 7. Create and add the new drop
             new_drop = Drop(
@@ -573,7 +599,7 @@ def fetch_new_drops_for_wave(wave_id, jwt_token):
                         db.session.commit()
                 
                 # Log summary of what happened
-                print(f"Drop sync summary: {total_fetched} fetched, {skipped_count} skipped, {drops_added} added, {stubs_created} stubs created, {authors_processed} authors processed")
+                print(f"Drop sync summary: {total_fetched} fetched, {skipped_count} skipped, {drops_added} added, {stubs_created} stubs created, {authors_processed} identities processed")
                 print(f"Serial range: {local_max_serial} → {newest_serial}")
                 
             except Exception as e:
@@ -730,7 +756,8 @@ def monitor_memes_chat(jwt_token=None):
 
 def handle_new_drops(new_drops, wave_id, jwt_token):
     drops_text = "\n".join([f"{drop.author}: {drop.content}" for drop in new_drops])
-
+    print(f"Processing {len(new_drops)} new drops... {drops_text}")
+    
     mentioned_drops = []
     replied_drops = []
     
@@ -750,17 +777,18 @@ def handle_new_drops(new_drops, wave_id, jwt_token):
     mentions_count = len(mentioned_drops)
     replies_count = len(replied_drops)
     
+    # Process mentions
     if mentions_count > 0:
         print(f"Processing {mentions_count} mention(s)")
         # Only reply to the 2 most recent unhandled mentions
-        unhandled_mentions = [drop for drop in mentioned_drops if not getattr(drop, 'bot_replied_to_mention', False)]
+        unhandled_mentions = [drop for drop in mentioned_drops if not getattr(drop, 'bot_replied_to', False)]
         # Sort by created_at desc, then serial_no desc as fallback
         unhandled_mentions.sort(key=lambda d: (d.created_at or datetime.min, d.serial_no), reverse=True)
         for drop in unhandled_mentions[:2]:
             print(f"Generating reply to mention in drop {drop.serial_no}...")
             try:
                 reply_to_mention(drop, jwt_token)
-                drop.bot_replied_to_mention = True
+                drop.bot_replied_to = True
                 db.session.commit()
             except Exception as e:
                 db.session.rollback()
@@ -768,15 +796,32 @@ def handle_new_drops(new_drops, wave_id, jwt_token):
         if len(unhandled_mentions) > 2:
             print(f"Skipped {len(unhandled_mentions) - 2} older unhandled mentions to avoid spamming.")
         for drop in mentioned_drops:
-            if getattr(drop, 'bot_replied_to_mention', False):
+            if getattr(drop, 'bot_replied_to', False):
                 print(f"Already replied to mention in drop {drop.serial_no}, skipping.")
 
+    # Process direct replies to bot's messages
     if replies_count > 0:
         print(f"Processing {replies_count} direct reply/replies")
-        for drop in replied_drops:
-            if drop not in mentioned_drops:  # avoid duplicate responses
-                print(f"Generating reply to direct reply in drop {drop.serial_no}...")
+        # Only reply to unhandled direct replies that aren't also mentions (to avoid duplicate responses)
+        unhandled_replies = [drop for drop in replied_drops 
+                            if not getattr(drop, 'bot_replied_to', False) and drop not in mentioned_drops]
+        # Sort by created_at desc, then serial_no desc as fallback
+        unhandled_replies.sort(key=lambda d: (d.created_at or datetime.min, d.serial_no), reverse=True)
+        # Only reply to the 2 most recent direct replies to avoid spamming
+        for drop in unhandled_replies[:2]:
+            print(f"Generating reply to direct reply in drop {drop.serial_no}...")
+            try:
                 reply_to_mention(drop, jwt_token)
+                drop.bot_replied_to = True
+                db.session.commit()
+            except Exception as e:
+                db.session.rollback()
+                print(f"Error replying to direct reply or updating DB for drop {drop.serial_no}: {e}")
+        if len(unhandled_replies) > 2:
+            print(f"Skipped {len(unhandled_replies) - 2} older direct replies to avoid spamming.")
+        for drop in replied_drops:
+            if getattr(drop, 'bot_replied_to', False):
+                print(f"Already replied to direct reply in drop {drop.serial_no}, skipping.")
     
     return mentions_count, replies_count
 
@@ -792,16 +837,10 @@ def reply_to_mention(drop, jwt_token):
     Respond directly to the comment in a firendly way keeping it brief (1-2 sentences).
     """
 
-    # Generate the response from the chatbot
-    response = client.chat.completions.create(
-        model="gpt-4.1",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=TEMPERATURE,
-    )
-    bot_response = response.choices[0].message.content.strip()
+    # Generate the response using the Responses API with model-specific parameters
+    params = create_openai_params("gpt-4.1", prompt)
+    response = client.responses.create(**params)
+    bot_response = response.output_text  # Simplified access to response text
 
     # Prepare the payload for posting the reply
     payload = {
@@ -853,15 +892,9 @@ def generate_general_response(drops_text):
 
     Craft a brief insightful responses.
     """
-    response = client.chat.completions.create(
-        model="gpt-4.1",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=TEMPERATURE,
-    )
-    bot_response = response.choices[0].message.content.strip()
+    params = create_openai_params("gpt-4.1", prompt)
+    response = client.responses.create(**params)
+    bot_response = response.output_text  # Simplified access to response text
     return bot_response
 
 def fetch_user_by_handle(jwt_token, handle, wave_id=None):
@@ -933,16 +966,12 @@ def respond_to_drop(drop, wave_id):
         Create a ___ response:
         """
 
-        # OpenAI API call
-        response = client.chat.completions.create(
-            model="gpt-4.1",
-            messages=[{"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt}],
-            temperature=TEMPERATURE,
-        )
+        # OpenAI Responses API call with gpt-4.1
+        params = create_openai_params("gpt-4.1", prompt)
+        response = client.responses.create(**params)
 
         # Get the response text
-        bot_response = response.choices[0].message.content.strip()
+        bot_response = response.output_text  # Simplified access to response text
 
         # Create the drop payload
         drop_payload = {
@@ -1081,7 +1110,9 @@ def safe_get_drops(params, headers):
         try:
             resp = requests.get(f"{BASE_URL}/drops", headers=headers, params=params)
             resp.raise_for_status()
-            return resp.json()          # ✅ success
+            drops_data = resp.json()
+            print(f"API returned {len(drops_data)} drops")
+            return drops_data          # ✅ success
         except HTTPError as err:
             # For "less than" queries, we handle gaps by stepping down
             if err.response.status_code == 404 and "serial_no_less_than" in params:
@@ -1155,10 +1186,16 @@ def fetch_all_drops_for_wave(jwt_token, wave_id):
         print(f"Fetching older drops (serial < {oldest_serial})...")
         serial_no = oldest_serial
         
-        while True:
+        # Collect all drops first before processing
+        all_drops = []
+        fetch_count = 0
+        max_fetches = 10  # Limit to 10 batches to avoid excessive API calls
+        
+        print("Paginating drops (limited to 10 batches)...")
+        while fetch_count < max_fetches:
             params = {
                 "wave_id": wave_id,
-                "limit": limit,
+                "limit": str(limit),
                 "include_replies": "true",
                 "drop_type": "CHAT"
             }
@@ -1169,63 +1206,92 @@ def fetch_all_drops_for_wave(jwt_token, wave_id):
             try:
                 drops = safe_get_drops(params, headers)
                 batch_size = len(drops)
+                fetch_count += 1
                 total_fetched += batch_size
                 
                 if not drops:
                     print("No more older drops to fetch")
                     break
                 
-                # Process this batch
-                batch_added, batch_skipped, batch_authors = process_drops_batch(drops, wave_id, jwt_token)
-                total_added += batch_added
-                total_skipped += batch_skipped
-                authors_processed += batch_authors
+                # Add to our collection instead of processing immediately
+                all_drops.extend(drops)
                 
                 # Prepare for next batch (use smallest serial we saw)
                 if batch_size > 0:
                     serials = [drop.get("serial_no", 0) for drop in drops]
                     serial_no = min(serials)
-                    print(f"Fetched batch of {batch_size} drops, min serial: {serial_no}")
+                    print(f"Fetched batch {fetch_count}: {batch_size} drops, min serial: {serial_no}")
                     
                     # Special case: if we've reached serial 1, we're done
                     if serial_no <= 1:
                         print("Reached the beginning of the wave's drops (serial <= 1)")
                         break
-                else:
-                    break
-                    
             except Exception as e:
                 print(f"Error fetching older drops: {e}")
                 break
+        
+        # Now process all drops at once
+        if all_drops:
+            print(f"Processing {len(all_drops)} drops in a single batch...")
+            batch_added, batch_skipped, batch_authors = process_drops_batch(all_drops, wave_id, jwt_token)
+            total_added += batch_added
+            total_skipped += batch_skipped
+            authors_processed += batch_authors
     
     # Fetch newer drops if needed (this is usually handled by fetch_new_drops_for_wave)
     if fetch_newer_drops:
         print(f"Fetching newer drops (serial > {max_serial})...")
         
-        params = {
-            "wave_id": wave_id,
-            "limit": limit,
-            "include_replies": "true",
-            "drop_type": "CHAT",
-            "serial_no_greater_than": max_serial
-        }
+        # Collect all newer drops first before processing
+        all_newer_drops = []
+        fetch_count = 0
+        max_fetches = 10  # Limit to 10 batches to avoid excessive API calls
+        current_serial = max_serial
         
-        try:
-            drops = safe_get_drops(params, headers)
-            batch_size = len(drops)
-            total_fetched += batch_size
+        print("Paginating newer drops (limited to 10 batches)...")
+        while fetch_count < max_fetches:
+            params = {
+                "wave_id": wave_id,
+                "limit": str(limit),
+                "include_replies": "true",
+                "drop_type": "CHAT",
+                "serial_no_greater_than": current_serial
+            }
             
-            if batch_size > 0:
-                print(f"Found {batch_size} newer drops to process")
-                batch_added, batch_skipped, batch_authors = process_drops_batch(drops, wave_id, jwt_token)
-                total_added += batch_added
-                total_skipped += batch_skipped
-                authors_processed += batch_authors
-            else:
-                print("No newer drops found")
+            try:
+                drops = safe_get_drops(params, headers)
+                batch_size = len(drops)
+                fetch_count += 1
+                total_fetched += batch_size
                 
-        except Exception as e:
-            print(f"Error fetching newer drops: {e}")
+                if not drops:
+                    print("No more newer drops to fetch")
+                    break
+                
+                # Add to our collection instead of processing immediately
+                all_newer_drops.extend(drops)
+                
+                # Prepare for next batch (use largest serial we saw)
+                if batch_size > 0:
+                    serials = [drop.get("serial_no", 0) for drop in drops]
+                    current_serial = max(serials)
+                    print(f"Fetched batch {fetch_count}: {batch_size} newer drops, max serial: {current_serial}")
+                else:
+                    break
+                    
+            except Exception as e:
+                print(f"Error fetching newer drops: {e}")
+                break
+        
+        # Now process all newer drops at once
+        if all_newer_drops:
+            print(f"Processing {len(all_newer_drops)} newer drops in a single batch...")
+            batch_added, batch_skipped, batch_authors = process_drops_batch(all_newer_drops, wave_id, jwt_token)
+            total_added += batch_added
+            total_skipped += batch_skipped
+            authors_processed += batch_authors
+        else:
+            print("No newer drops found")
     
     print(f"Drops fetch summary: {total_fetched} fetched, {total_added} added, {total_skipped} skipped, {authors_processed} authors processed")
 
@@ -1272,15 +1338,15 @@ def process_drops_batch(drops, wave_id, jwt_token):
         # Get created_at using the extraction utility
         created_at = extract_field_value(drop_data, "created_at")
         
-        # Process author if needed
+        # Process identity if needed
         with db.session.no_autoflush:
-            author_data = Author.query.get(author_handle)
+            author_data = Identity.query.get(author_handle)
             if author_data is None and author_handle != "Unknown":
                 user_info = fetch_user_by_handle(jwt_token, author_handle, wave_id)
                 if user_info:
                     authors_processed += 1
-                    author_data = upsert_author(user_info, author_handle, wave_id)
-                    check_object_for_dicts(author_data, f"Author-{author_handle}")
+                    author_data = upsert_identity(user_info, author_handle, wave_id)
+                    check_object_for_dicts(author_data, f"Identity-{author_handle}")
                 else:
                     # Fallback to minimal record
                     minimal_user_info = {
@@ -1288,7 +1354,7 @@ def process_drops_batch(drops, wave_id, jwt_token):
                         'profile_url': f"https://6529.io/{author_handle}"
                     }
                     authors_processed += 1
-                    author_data = upsert_author(minimal_user_info, author_handle)
+                    author_data = upsert_identity(minimal_user_info, author_handle)
                     
         # Create the drop
         new_drop = Drop(
@@ -1327,54 +1393,74 @@ def process_drops_batch(drops, wave_id, jwt_token):
 
 # MAIN FLOW for setting up the bot
 def post_gm_message(wave_id, jwt_token):
-    """Post a 'gm' style greeting to the wave to announce bot presence."""
-    import random
-    gm_variants = [
-        "gm wavers! bot's in the bar now.",
-        "gmeme, memers. chatbot69 reporting for duty.",
-        "gm to all you dive bar denizens!",
-        "hey all, i'm here now. gm!",
-        "gm, wave. bot online."
-    ]
-    bot_response = random.choice(gm_variants)
+    """Post a 'gm' style greeting to the wave to announce bot presence using the LLM."""
+    prompt = """
+    Generate a brief, casual 'gm' (good morning) style greeting to announce your presence in a chat. 
+    Make it friendly, slightly memetic, and under 100 characters. 
+    This is your first message in the channel, so introduce yourself subtly.
+    Here's some examples, but you should get creative:
+    "gm wavers! bot's in the bar now.",
+    "gmeme, memers. chatbot69 reporting for duty.",
+    "gm to all you dive bar denizens!",
+    "hey all, i'm here now. gm!",
+    "gm, wave. bot online."
+    """
+    
+    # Use gpt-4.1 for all models
+    params = create_openai_params("gpt-4.1", prompt)
+    response = client.responses.create(**params)
+    
+    bot_response = response.output_text.strip()
+    print(f"Generated gm message: {bot_response}")
     post_general_response(wave_id, bot_response, jwt_token)
 
 
-def check_for_unhandled_mentions(wave_id, jwt_token):
-    """Check for recent unhandled mentions and process up to 2 of them."""
-    print("Checking for any unhandled mentions from previous sessions...")
-    print(f"Bot handle is: '{BOT_HANDLE}'")
+def check_for_unhandled_interactions(wave_id, jwt_token):
+    """Check for recent unhandled mentions and direct replies and process up to 2 of each."""
+    print("Checking for any unhandled interactions from previous sessions...")
     
     # Find drops that mention the bot but haven't been replied to yet
     import re
     mention_pattern = re.compile(rf"(?<!\w)@{re.escape(BOT_HANDLE)}(?!\w)", re.IGNORECASE)
     
-    # Query for drops that mention the bot
-    potential_mentions = Drop.query.filter_by(wave_id=wave_id).order_by(Drop.created_at.desc()).limit(100).all()
-    print(f"Found {len(potential_mentions)} potential mentions to check")
+    # Query for recent drops to check for mentions and replies
+    recent_drops = Drop.query.filter_by(wave_id=wave_id).order_by(Drop.created_at.desc()).limit(100).all()
+    print(f"Found {len(recent_drops)} recent drops to check")
     
-    # Filter for actual mentions that haven't been replied to
+    # Filter for unhandled mentions
     unhandled_mentions = []
-    for drop in potential_mentions:
+    for drop in recent_drops:
         is_explicit_mention = bool(mention_pattern.search(drop.content or ""))
-        if is_explicit_mention and not getattr(drop, 'bot_replied_to_mention', False):
+        if is_explicit_mention and not getattr(drop, 'bot_replied_to', False):
             unhandled_mentions.append(drop)
-            print(f"  Added as unhandled mention")
+            print(f"  Added drop {drop.serial_no} as unhandled mention")
     
-    print(f"Found {len(unhandled_mentions)} unhandled mentions to process")
+    # Filter for unhandled direct replies to bot's messages
+    unhandled_replies = []
+    for drop in recent_drops:
+        if drop.reply_to_id:
+            parent_drop = Drop.query.get(drop.reply_to_id)
+            if parent_drop and parent_drop.author.lower() == BOT_HANDLE.lower() and not getattr(drop, 'bot_replied_to', False):
+                # Only add if it's not already in the mentions list (to avoid duplicate responses)
+                if drop not in unhandled_mentions:
+                    unhandled_replies.append(drop)
+                    print(f"  Added drop {drop.serial_no} as unhandled direct reply")
+    
+    print(f"Found {len(unhandled_mentions)} unhandled mentions and {len(unhandled_replies)} unhandled direct replies to process")
 
     # Sort by created_at desc, then serial_no desc as fallback
     unhandled_mentions.sort(key=lambda d: (d.created_at or datetime.min, d.serial_no), reverse=True)
+    unhandled_replies.sort(key=lambda d: (d.created_at or datetime.min, d.serial_no), reverse=True)
     
     # Process up to 2 most recent unhandled mentions
     mentions_count = len(unhandled_mentions[:2])
     if mentions_count > 0:
-        print(f"Found {mentions_count} unhandled mentions from previous sessions")
+        print(f"Processing {mentions_count} unhandled mentions from previous sessions")
         for drop in unhandled_mentions[:2]:
             print(f"Generating reply to previously unhandled mention in drop {drop.serial_no}...")
             try:
                 reply_to_mention(drop, jwt_token)
-                drop.bot_replied_to_mention = True
+                drop.bot_replied_to = True
                 db.session.commit()
             except Exception as e:
                 db.session.rollback()
@@ -1382,7 +1468,23 @@ def check_for_unhandled_mentions(wave_id, jwt_token):
     else:
         print("No unhandled mentions found from previous sessions.")
     
-    return mentions_count
+    # Process up to 2 most recent unhandled direct replies
+    replies_count = len(unhandled_replies[:2])
+    if replies_count > 0:
+        print(f"Processing {replies_count} unhandled direct replies from previous sessions")
+        for drop in unhandled_replies[:2]:
+            print(f"Generating reply to previously unhandled direct reply in drop {drop.serial_no}...")
+            try:
+                reply_to_mention(drop, jwt_token)
+                drop.bot_replied_to = True
+                db.session.commit()
+            except Exception as e:
+                db.session.rollback()
+                print(f"Error replying to direct reply or updating DB for drop {drop.serial_no}: {e}")
+    else:
+        print("No unhandled direct replies found from previous sessions.")
+    
+    return mentions_count + replies_count
 
 # Check if running migrations or any flask db command
 import sys
@@ -1399,10 +1501,13 @@ with app.app_context():
     if running_migrations:
         print("Database migration detected - skipping initialization and data loading")
     else:
-        # Start the scheduler for all non-migration runs
-        if not scheduler.running:
+        # Start the scheduler for all non-migration runs, unless explicitly skipped
+        skip_scheduler = os.environ.get('SKIP_SCHEDULER', '').lower() == 'true'
+        if not scheduler.running and not skip_scheduler:
             scheduler.start()
             print("Scheduler started - background jobs are now running")
+        elif skip_scheduler:
+            print("Scheduler start skipped due to SKIP_SCHEDULER environment variable")
             
         # Only load data when not in migration mode
         jwt_token = authenticate()
@@ -1415,8 +1520,8 @@ with app.app_context():
                     print("First time loading drops for this wave. Posting a gm message.")
                     post_gm_message(wave.id, jwt_token)
                 else:
-                    # Check for any unhandled mentions that we might have missed
-                    check_for_unhandled_mentions(wave.id, jwt_token)
+                    # Check for any unhandled mentions or direct replies that we might have missed
+                    check_for_unhandled_interactions(wave.id, jwt_token)
                 print("Initial data loaded. Scheduled jobs will handle ongoing updates.")
 
 # Add a new job that runs every 2 hours to generate activity when the channel is quiet
@@ -1515,7 +1620,7 @@ def activity_check_job():
                 
                 # Let the LLM decide the most appropriate response
                 prompt = f"""
-                You are a bot named {BOT_HANDLE} in a chat wave called "{chosen_wave}". 
+                You are a bot named {BOT_HANDLE} in a chat wave called "{WAVE_NAME}". 
                 The conversation has been inactive for a while, and you need to post a message to keep it active.
                 
                 CONTEXT INFORMATION:
@@ -1530,7 +1635,7 @@ def activity_check_job():
                 Based on this context, determine the most appropriate type of message to send:
                 1. A direct clever reply to the last message
                 2. A random thought related to the conversation themes
-                3. A once-a-day greeting, like "gm wavers", or "gmeme, memers", or "gm to all you dive bar denizens". get creative! 
+                3. A once-a-day greeting, like "gm wavers", or "gmeme, memers", or "gm to all you dive bar denizens"... make sure it's relevant to the Wave {WAVE_NAME}! 
                 
                 Choose the most natural and context-appropriate option. If the last message asks a question or seems to invite a response, prefer a direct reply.
                 If the conversation has been dormant for a long time, a greeting or new topic might be better.
@@ -1542,16 +1647,10 @@ def activity_check_job():
                 Reasoning: [Brief explanation of why you chose this type]
                 """
                 
-                response = client.chat.completions.create(
-                    model="gpt-4.1",
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=TEMPERATURE,
-                )
+                params = create_openai_params("gpt-4.1", prompt)
+                response = client.responses.create(**params)
                 
-                llm_response = response.choices[0].message.content.strip()
+                llm_response = response.output_text  # Simplified access to response text
                 
                 # Parse the LLM response to extract message type and content
                 message_type = None
