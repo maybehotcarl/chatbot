@@ -57,6 +57,7 @@ Your responses should be short, and punchy.
 Match the tone, diction, and style of the existing conversation.
 Avoid piling on the web3 lingo, but you are aware of how the tech works.
 Be cool, don't be cringe.
+Mix up your sentance layout, structure and phrasing.
 Stick to lowercase letters, and feel free to use emojis (but don't over-do it).
 
 Remember, you are part of a network state revolution, powered by art NFTs and their hodlers.
@@ -106,6 +107,7 @@ def safely_create_identity(user_info, author_handle, wave_id=None):
 def create_openai_params(model, prompt_input, system_instructions=None):
     """Create parameters for OpenAI API call with model-specific handling.
     Some models like o3 don't support temperature parameter.
+    For gpt-4.1, web_search tool is always enabled.
     
     Args:
         model: The OpenAI model to use
@@ -125,6 +127,10 @@ def create_openai_params(model, prompt_input, system_instructions=None):
     # Only add temperature for models that support it (not o3)
     if not params["model"].startswith("o3"):
         params["temperature"] = TEMPERATURE
+    
+    # Always add web_search tool for gpt-4.1
+    if model == "gpt-4.1":
+        params["tools"] = [{"type": "web_search"}]
         
     return params
 
@@ -661,110 +667,7 @@ def fetch_new_drops_for_wave(wave_id, jwt_token):
 
     return new_serials
 
-def process_specific_drops(wave_id, serial_numbers, jwt_token):
-    """
-    Process specific drops by serial number for interaction responses.
-    """
-    if not serial_numbers or len(serial_numbers) == 0:
-        print("No specific drops to process")
-        return
-        
-    # Fetch the drops by their serial numbers
-    specific_drops = Drop.query.filter(
-        Drop.wave_id == wave_id, 
-        Drop.serial_no.in_(serial_numbers)
-    ).all()
-    
-    print(f"Found {len(specific_drops)} specific drops to process")
-    
-    if specific_drops:
-        try:
-            mentions_count, replies_count = handle_new_drops(specific_drops, wave_id, jwt_token)
-            print(f"Interaction summary: {mentions_count} mentions, {replies_count} direct replies")
-        except Exception as e:
-            print(f"Error handling specific drops: {e}")
-            return
-            
-        # Get the wave tracking record
-        wave_tracking = WaveTracking.query.filter_by(wave_id=wave_id).first()
-        if not wave_tracking:
-            print("❌ Wave tracking not found")
-            return
-            
-        # Add the count of new drops to the accumulator
-        wave_tracking.accumulated_new_drops += len(specific_drops)
-        print(f"Accumulated new drops: {wave_tracking.accumulated_new_drops}/{GENERAL_RESPONSE_THRESHOLD}")
-        
-        # Only generate responses if the accumulated count exceeds threshold
-        general_response_posted = False
-        if wave_tracking.accumulated_new_drops >= GENERAL_RESPONSE_THRESHOLD:
-            wave_tracking.accumulated_new_drops = 0
-            
-            # Get drops that aren't from the bot itself
-            non_bot_drops = [drop for drop in specific_drops if drop.author.lower() != BOT_HANDLE.lower()]
-            
-            if non_bot_drops:
-                # Sort by serial number (descending) to get the most recent drops
-                sorted_drops = sorted(non_bot_drops, key=lambda d: d.serial_no, reverse=True)
-                
-                # Limit to responding to at most 3 drops to avoid spamming
-                drops_to_respond_to = sorted_drops[:3]
-                
-                # Get all recent drops for context
-                all_recent_drops = sorted(specific_drops, key=lambda d: d.serial_no, reverse=True)[:10]
-                all_drops_text = "\n".join([f"{drop.author}: {drop.content}" for drop in all_recent_drops])
-                
-                responses_count = 0
-                
-                # Generate individual responses for each drop
-                for drop_to_respond_to in drops_to_respond_to:
-                    print(f"Generating a response to drop {drop_to_respond_to.serial_no} by {drop_to_respond_to.author}...")
-                    
-                    # Create a context that includes the specific drop being responded to
-                    # and some of the surrounding conversation
-                    context_text = f"""
-                    You are specifically replying to this message: {drop_to_respond_to.author}: {drop_to_respond_to.content}
-                    
-                    Recent conversation context:
-                    {all_drops_text}
-                    
-                    REMEMBER: You are specifically writing a reply to this message: {drop_to_respond_to.author}: {drop_to_respond_to.content}
-                    """
-                    
-                    bot_response = generate_general_response(context_text)
-                    
-                    if bot_response is None:
-                        print(f"Response generation failed for drop {drop_to_respond_to.serial_no}")
-                        continue
-                    
-                    # Post the response as a reply to this specific drop using retry mechanism
-                    try:
-                        post_response_with_retry(
-                            wave_id=wave_id,
-                            content=bot_response,
-                            jwt_token=jwt_token,
-                            reply_to_id=drop_to_respond_to.id,
-                            reply_to_part_id=0
-                        )
-                        responses_count += 1
-                        print(f"Response posted as a reply to drop {drop_to_respond_to.serial_no}!")
-                    except Exception as e:
-                        # Error already printed below
-                        print(f"Error posting response to drop {drop_to_respond_to.serial_no} after retries: {e}")
-                
-                general_response_posted = responses_count > 0
-                print(f"Posted {responses_count} individual responses to drops")
-        
-        try:
-            # Save the accumulated count
-            db.session.commit()
-        except Exception as e:
-            db.session.rollback()  # Rollback on failure
-            print(f"Database error: {e}")
-        
-        print(f"Processing completed: {len(specific_drops)} drops processed, general response: {'yes' if general_response_posted else 'no'}")
-    else:
-        print("No matching drops found for the serial numbers")
+
 
 """
 ===================================================
@@ -832,11 +735,12 @@ def monitor_memes_chat(jwt_token=None):
             # Sort by serial number (descending) to get the most recent drops
             sorted_drops = sorted(non_bot_drops, key=lambda d: d.serial_no, reverse=True)
             
-            # Limit to responding to at most 3 drops to avoid spamming
-            drops_to_respond_to = sorted_drops[:3]
-            
             # Get all recent drops for context
-            all_recent_drops = sorted(new_drops, key=lambda d: d.serial_no, reverse=True)[:10]
+            all_recent_drops = sorted(new_drops, key=lambda d: d.serial_no, reverse=True)[:30]
+            
+            # Use LLM to intelligently select which drops to respond to
+            drops_to_respond_to = select_drops_to_respond_to(sorted_drops, all_recent_drops)
+            
             all_drops_text = "\n".join([f"{drop.author}: {drop.content}" for drop in all_recent_drops])
             
             responses_count = 0
@@ -988,7 +892,10 @@ def reply_to_mention(drop, jwt_token):
     prompt = f"""
     You were mentioned in the following post:
     {drop.content}
-    Respond directly to the comment in a firendly way keeping it brief (1-2 sentences).
+    Respond directly to the comment in a friendly way keeping it brief (1-2 sentences).
+    If the message contains a question that would benefit from recent or factual information, use web search
+    to inform your response. Always keep your answers brief, conversational, and in your usual style.
+    Don't include citations or attribution to sources in your responses, unless asked directly. 
     """
 
     # Generate the response using the Responses API with model-specific parameters
@@ -1031,6 +938,91 @@ def get_last_50_drops(wave_id):
     drops.reverse()  # Ensure they're in chronological order
     return drops
 
+def select_drops_to_respond_to(non_bot_drops, all_recent_drops):
+    """
+    Uses the LLM to intelligently select 1-2 most relevant drops to respond to.
+    
+    Args:
+        non_bot_drops: List of drops not from the bot, candidates for response
+        all_recent_drops: All recent drops for conversation context
+        
+    Returns:
+        List of drop objects selected by the LLM for response
+    """
+    # Prepare detailed data about each drop for LLM analysis
+    drop_details = []
+    for i, drop in enumerate(non_bot_drops[:10]):  # Limit to 10 candidates for LLM context
+        reply_to = None
+        if drop.reply_to_id:
+            for recent_drop in all_recent_drops:
+                if recent_drop.id == drop.reply_to_id:
+                    reply_to = f"Reply to '{recent_drop.author}: {recent_drop.content[:50]}...' (ID: {recent_drop.id})"
+                    break
+        
+        drop_details.append({
+            "index": i,
+            "id": drop.id,
+            "serial_no": drop.serial_no,
+            "author": drop.author,
+            "content": drop.content,
+            "reply_to": reply_to or "Not a reply"
+        })
+    
+    # Create conversation context for LLM
+    conversation_context = "\n".join([f"{drop.author}: {drop.content}" for drop in all_recent_drops])
+    
+    # Create prompt for the LLM
+    prompt_text = f"""
+    You are a social media assistant analyzing a conversation to determine which messages should be responded to.
+    
+    Here's the recent conversation for context:
+    {conversation_context}
+    
+    Below are candidate messages that could be responded to. Your task is to select 1-2 messages that are most worthy of a response:
+    
+    {json.dumps(drop_details, indent=2)}
+    
+    Select 1-2 messages that are most worthy of a response based on the following criteria:
+    1. Relevance to ongoing discussion
+    2. Questions or statements that seem to invite a response
+    3. Avoid selecting multiple messages from the same author
+    4. Prioritize more recent messages if relevant
+    5. Consider conversation flow and context
+    6. Prioritize messages that contain questions about factual information, current events, or topics that might benefit from web search
+    
+    Response format: Return a JSON array. It should contain ONLY the "id" values of the 1-2 selected messages. Example: ["message-id-1", "message-id-2"] or ["message-id-1"]
+    """
+    
+    try:
+        # Call the LLM to make the selection
+        params = create_openai_params("gpt-4.1", prompt_text)
+        response = client.responses.create(**params)
+        response_text = response.output_text.strip()
+        
+        # Extract the JSON array from the response
+        # Find the first occurrence of [ and the last occurrence of ]
+        start_idx = response_text.find('[')
+        end_idx = response_text.rfind(']')
+        
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            json_str = response_text[start_idx:end_idx+1]
+            selected_ids = json.loads(json_str)
+            
+            # Find the drop objects that match the selected IDs
+            selected_drops = [drop for drop in non_bot_drops if drop.id in selected_ids]
+            
+            print(f"LLM selected {len(selected_drops)} drop[s] to respond to: {[drop.id for drop in selected_drops]}")
+            return selected_drops
+        else:
+            print("Could not parse LLM response as JSON array")
+            print(f"LLM response: {response_text}")
+            # Fallback to the first drop if parsing fails
+            return [non_bot_drops[0]] if non_bot_drops else []
+    except Exception as e:
+        print(f"Error selecting drops to respond to: {e}")
+        # Fallback to the first drop if an error occurs
+        return [non_bot_drops[0]] if non_bot_drops else []
+
 def generate_general_response(drops_text):
     """
     Generates a general response based on the content of recent drops.
@@ -1046,7 +1038,7 @@ def generate_general_response(drops_text):
     if len(drops_text) > MAX_DROPS_TEXT_LENGTH:
         print(f"Trimming drops_text from {len(drops_text)} to {MAX_DROPS_TEXT_LENGTH} characters.")
         drops_text = drops_text[-MAX_DROPS_TEXT_LENGTH:]
-
+    
     prompt = f"""
     Here's a recent conversation from the Memes-Chat wave:
 
@@ -1055,10 +1047,16 @@ def generate_general_response(drops_text):
     Craft a single brief, insightful response that contributes to the conversation.
     Do NOT prefix your response with your name or any labels.
     Just write the response directly as if you're speaking in the chat.
+    
+    If the conversation would benefit from recent or factual information, use web search
+    to inform your response. Always keep your answers brief, conversational, and in the
+    style of the chat - no citations or attributions needed.
     """
+    
     params = create_openai_params("gpt-4.1", prompt)
     response = client.responses.create(**params)
     bot_response = response.output_text  # Simplified access to response text
+    
     return bot_response
 
 def fetch_user_by_handle(jwt_token, handle, wave_id=None):
@@ -1161,7 +1159,10 @@ def respond_to_drop(drop, wave_id):
         prompt = f"""
         A group chat participant who is responding to this drop:
         Drop Content: "{drop.content}"
-        Create a ___ response:
+        Create a brief, engaging response. If the message contains questions about current facts, events, 
+        or information that might benefit from up-to-date knowledge, use web search to inform your response. 
+        Keep your answer conversational and in the style of the community chat.
+        Don't include citations or attribution to sources in your responses, unless asked directly. 
         """
 
         # OpenAI Responses API call with gpt-4.1
@@ -1336,6 +1337,9 @@ def fetch_all_drops_for_wave(jwt_token, wave_id):
     """
     print(f"Smart-fetching drops for wave {wave_id}...")
     
+    # Define our maximum drops threshold
+    max_total_drops = 200  # Stop fetching once we have 200 drops in total
+    
     # First check what data we already have in our database
     drop_count = Drop.query.filter_by(wave_id=wave_id).count()
     print(f"Database currently has {drop_count} drops for this wave")
@@ -1371,7 +1375,7 @@ def fetch_all_drops_for_wave(jwt_token, wave_id):
         "Accept": "application/json"
     }
     url = f"{BASE_URL}/drops"
-    limit = 1420
+    limit = "19"  
     
     # Track counts for final summary
     total_fetched = 0
@@ -1379,8 +1383,16 @@ def fetch_all_drops_for_wave(jwt_token, wave_id):
     total_skipped = 0
     authors_processed = 0
     
+    # Check if we already have more than our max_total_drops
+    if fetch_older_drops and drop_count >= max_total_drops:
+        print(f"Already have {drop_count} drops which exceeds our limit of {max_total_drops}. Skipping older drop fetch.")
+        fetch_older_drops = False
+    
     # Fetch older drops if needed (decreasing serial numbers)
     if fetch_older_drops:
+        # Calculate how many more drops we need
+        drops_to_fetch = max_total_drops - drop_count
+        print(f"Have {drop_count} drops, need {drops_to_fetch} more to reach limit of {max_total_drops}")
         print(f"Fetching older drops (serial < {oldest_serial})...")
         serial_no = oldest_serial
         
@@ -1389,11 +1401,11 @@ def fetch_all_drops_for_wave(jwt_token, wave_id):
         fetch_count = 0
         max_fetches = 10  # Limit to 10 batches to avoid excessive API calls
         
-        print("Paginating drops (limited to 10 batches)...")
+        print(f"Paginating drops (limited to {max_fetches} batches or {max_total_drops} total drops)...")
         while fetch_count < max_fetches:
             params = {
                 "wave_id": wave_id,
-                "limit": str(limit),
+                "limit": limit,
                 "include_replies": "true",
                 "drop_type": "CHAT"
             }
@@ -1419,6 +1431,11 @@ def fetch_all_drops_for_wave(jwt_token, wave_id):
                     serials = [drop.get("serial_no", 0) for drop in drops]
                     serial_no = min(serials)
                     print(f"Fetched batch {fetch_count}: {batch_size} drops, min serial: {serial_no}")
+                    
+                    # Check if we've reached the maximum total drops limit
+                    if len(all_drops) >= max_total_drops:
+                        print(f"Reached maximum total drops limit ({max_total_drops}), older are probably less relevant")
+                        break
                     
                     # Special case: if we've reached serial 1, we're done
                     if serial_no <= 1:
@@ -1603,12 +1620,13 @@ def post_gm_message(wave_id, jwt_token):
     Generate a brief, casual 'gm' (good morning) style greeting to announce your presence in a chat. 
     Make it friendly, slightly memetic, and under 100 characters. 
     This is your first message in the channel, so introduce yourself subtly.
+    The name of the channel is {WAVE_NAME}. 
+    Don't bother mentioning that you now have web search capabilities to help provide up-to-date information. That's expected of everyone chatting anyway. 
     Here's some examples, but you should get creative:
-    "gm wavers! bot's in the bar now.",
     "gmeme, memers. chatbot69 reporting for duty.",
-    "gm to all you dive bar denizens!",
-    "hey all, i'm here now. gm!",
+    "gm to all you dive bar denizens!" (eg: for bar-themed waves),
     "gm, wave. bot online."
+    or simply: "gm" or "gmeme"
     """
     
     # Use gpt-4.1 for all models
@@ -1859,6 +1877,10 @@ def activity_check_job():
                 Choose the most natural and context-appropriate option. If the last message asks a question or seems to invite a response, prefer a direct reply.
                 If the conversation has been dormant for a long time, a greeting or new topic might be better.
                 Only use a greeting like "gm" if it hasn't been used today. you can gm at any time of day.
+                
+                IMPORTANT: You also have web search capabilities! If the conversation involves questions about current events, facts, 
+                or topics that would benefit from up-to-date information, references to recent events or new releases,use web search to inform your response. Don't mention that
+                you're using web search - just incorporate the information naturally into your message.
                 
                 FORMAT YOUR RESPONSE LIKE THIS:
                 Message type: [REPLY, THOUGHT, or GREETING]
