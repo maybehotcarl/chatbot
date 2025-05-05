@@ -53,12 +53,17 @@ humans and benevolent ASI alike—resilient, permissionless, and purpose-built f
 When we talk about the power of "memes" we mean intersubjective myths, symbols, and cultural references.
 The folks who hangout here get it, support an Open Metaverse, and are mostly long-term crypto and NFT hodlers.
 
-Your responses should be short, and punchy.
+Your responses should be short and punchy.
 Match the tone, diction, and style of the existing conversation.
-Avoid piling on the web3 lingo, but you are aware of how the tech works.
+Avoid overuse of web3 lingo, but you are aware of how the tech works.
 Be cool, don't be cringe.
-Mix up your sentance layout, structure and phrasing.
+Mix up your sentance layout, structure and phrasing, avoid using dashes.
+Look over your previous responses for consistency, and provide variety without repetition.
 Stick to lowercase letters, and feel free to use emojis (but don't over-do it).
+Drop in a very occasional typo, misspelling, contractions without apostrophes, minimal or missing punctuation, etc. 
+Use very infrequest mild slang swear words.
+Sometimes, rarely, you answer with just 1 word. 
+
 
 Remember, you are part of a network state revolution, powered by art NFTs and their hodlers.
 Be kind to others, and support and help them out as you are able.
@@ -117,10 +122,30 @@ def create_openai_params(model, prompt_input, system_instructions=None):
     # Use SYSTEM_PROMPT as default if system_instructions is not provided
     if system_instructions is None:
         system_instructions = SYSTEM_PROMPT
+    
+    # Keep system_instructions static for prompt caching
+    # Fetch recent bot messages and append to the prompt instead
+    modified_prompt = prompt_input
+    
+    try:
+        # Get the 10 most recent bot messages
+        recent_bot_drops = Drop.query.filter_by(author=BOT_HANDLE).order_by(
+            Drop.created_at.desc()
+        ).limit(10).all()
+        
+        # Extract just the content
+        recent_responses = [drop.content for drop in recent_bot_drops if drop.content]
+        
+        # If we have recent responses, append them to the prompt
+        if recent_responses:
+            recent_responses_text = "\n".join([f"- {resp}" for resp in recent_responses])
+            modified_prompt += f"\n\nNOTE: These are my 10 most recent messages. Please avoid repeating similar phrasings, topics, or using cringe slang:\n{recent_responses_text}\n\nMake your response clearly distinct from these previous messages."
+    except Exception as e:
+        print(f"Error fetching recent bot responses: {e}")
         
     params = {
         "model": model,
-        "input": prompt_input,
+        "input": modified_prompt,
         "instructions": system_instructions,
     }
     
@@ -197,6 +222,69 @@ def extract_field_value(data, field_name, default=None):
         return json.dumps(value)
     
     return value or default
+
+
+# Utility functions for parsing LLM API responses
+def parse_structured_llm_response(response_text, expected_keys):
+    """
+    Parses a structured LLM response with key-value pairs.
+    
+    Args:
+        response_text (str): The text response from the LLM
+        expected_keys (list): List of keys to extract from the response
+        
+    Returns:
+        dict: Dictionary with keys from expected_keys and their extracted values
+    """
+    results = {key: None for key in expected_keys}
+    
+    for line in response_text.split('\n'):
+        line = line.strip()
+        for key in expected_keys:
+            # Format the key as expected in the response (e.g., "message type:")
+            formatted_key = key.lower().replace('_', ' ') + ':'
+            if line.lower().startswith(formatted_key):
+                results[key] = line.split(':', 1)[1].strip()
+                
+    return results
+
+
+def extract_json_from_text(response_text):
+    """
+    Extracts a JSON object or array from LLM response text.
+    
+    Args:
+        response_text (str): The text response from the LLM
+        
+    Returns:
+        tuple: (parsed_json, success)
+            - parsed_json: The parsed JSON object or None if parsing failed
+            - success: Boolean indicating if parsing was successful
+    """
+    try:
+        # Find the first occurrence of [ or { and the last occurrence of ] or }
+        start_idx_array = response_text.find('[')
+        start_idx_object = response_text.find('{')
+        
+        # Determine which type of JSON structure we're dealing with
+        if start_idx_array != -1 and (start_idx_object == -1 or start_idx_array < start_idx_object):
+            start_idx = start_idx_array
+            end_idx = response_text.rfind(']')
+        elif start_idx_object != -1:
+            start_idx = start_idx_object
+            end_idx = response_text.rfind('}')
+        else:
+            return None, False
+        
+        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+            json_str = response_text[start_idx:end_idx+1]
+            parsed_json = json.loads(json_str)
+            return parsed_json, True
+        else:
+            return None, False
+    except Exception as e:
+        print(f"Error extracting JSON from text: {e}")
+        return None, False
 
 def upsert_identity(user_info, author_handle, wave_id=None):
     """
@@ -595,7 +683,7 @@ def fetch_new_drops_for_wave(wave_id, jwt_token):
                 author_data = Identity.query.get(author_handle)
                 if author_data is None:
                     # If we don't have it in our local DB, fetch from API
-                    user_info = fetch_user_by_handle(jwt_token, author_handle, wave_id)
+                    user_info = fetch_user_by_handle(jwt_token, author_handle)
                     if user_info:
                         authors_processed += 1
                         author_data = upsert_identity(user_info, author_handle, wave_id)
@@ -999,15 +1087,10 @@ def select_drops_to_respond_to(non_bot_drops, all_recent_drops):
         response = client.responses.create(**params)
         response_text = response.output_text.strip()
         
-        # Extract the JSON array from the response
-        # Find the first occurrence of [ and the last occurrence of ]
-        start_idx = response_text.find('[')
-        end_idx = response_text.rfind(']')
+        # Extract the JSON array from the response using our utility function
+        selected_ids, success = extract_json_from_text(response_text)
         
-        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            json_str = response_text[start_idx:end_idx+1]
-            selected_ids = json.loads(json_str)
-            
+        if success and isinstance(selected_ids, list):
             # Find the drop objects that match the selected IDs
             selected_drops = [drop for drop in non_bot_drops if drop.id in selected_ids]
             
@@ -1059,7 +1142,7 @@ def generate_general_response(drops_text):
     
     return bot_response
 
-def fetch_user_by_handle(jwt_token, handle, wave_id=None):
+def fetch_user_by_handle(jwt_token, handle):
     """
     Returns the profile JSON for @handle or None on error.
     """
@@ -1557,7 +1640,7 @@ def process_drops_batch(drops, wave_id, jwt_token):
         with db.session.no_autoflush:
             author_data = Identity.query.get(author_handle)
             if author_data is None and author_handle != "Unknown":
-                user_info = fetch_user_by_handle(jwt_token, author_handle, wave_id)
+                user_info = fetch_user_by_handle(jwt_token, author_handle)
                 if user_info:
                     authors_processed += 1
                     author_data = upsert_identity(user_info, author_handle, wave_id)
@@ -1629,7 +1712,6 @@ def post_gm_message(wave_id, jwt_token):
     or simply: "gm" or "gmeme"
     """
     
-    # Use gpt-4.1 for all models
     params = create_openai_params("gpt-4.1", prompt)
     response = client.responses.create(**params)
     
@@ -1893,19 +1975,14 @@ def activity_check_job():
                 
                 llm_response = response.output_text  # Simplified access to response text
                 
-                # Parse the LLM response to extract message type and content
-                message_type = None
-                message_content = None
-                reasoning = None
+                # Parse the LLM response using our utility function
+                expected_keys = ["message_type", "message", "reasoning"]
+                parsed_response = parse_structured_llm_response(llm_response, expected_keys)
                 
-                for line in llm_response.split('\n'):
-                    line = line.strip()
-                    if line.lower().startswith("message type:"):
-                        message_type = line.split(":", 1)[1].strip().upper()
-                    elif line.lower().startswith("message:"):
-                        message_content = line.split(":", 1)[1].strip()
-                    elif line.lower().startswith("reasoning:"):
-                        reasoning = line.split(":", 1)[1].strip()
+                # Extract the values from the parsed response
+                message_type = parsed_response["message_type"].upper() if parsed_response["message_type"] else None
+                message_content = parsed_response["message"]
+                reasoning = parsed_response["reasoning"]
                 
                 if not message_type or not message_content:
                     print("❌ Failed to parse LLM response. Not sending any message.")
