@@ -8,4 +8,5 @@ openai>=1.20.0
 eth-account==0.8.0
 apscheduler==3.9.1
 SQLAlchemy==2.0.15
-# SQLite is included in Python standard library, no need for extra package
+playwright==1.52.0
+beautifulsoup4==4.11.1

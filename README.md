@@ -32,7 +32,6 @@ A Flask-based chatbot for interacting with the 6529.io API and participating in 
    python reset_db.py --force
    ```
 
-
 ## Running the Bot
 
 To start the bot in interactive mode:
@@ -70,6 +69,7 @@ This will:
 - 6529.io API for interacting with the wave chat
 
 ## Development
+
 For development purposes, you can use the Flask CLI:
 
    ```bash
@@ -84,7 +84,6 @@ Database migrations can be managed with:
    flask db migrate -m "Description of changes"
    flask db upgrade
    ```
-
 
 ## Troubleshooting
 

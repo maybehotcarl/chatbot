@@ -1,5 +1,4 @@
 import os
-import re
 import json
 import atexit
 import time
@@ -18,6 +17,8 @@ from requests.exceptions import HTTPError
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
+from playwright.sync_api import sync_playwright
+
 import hashlib
 from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
 import functools
@@ -31,6 +32,78 @@ load_dotenv()
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# Import Pydantic for structured outputs
+from pydantic import BaseModel, Field
+from typing import Union, List, Dict
+
+# Define a Pydantic model for the bot identity
+class BotIdentity(BaseModel):
+    description: Union[str, None]
+    level: int
+    tdh: int
+    rep: int
+    rep_assigners: Union[List[str], None]
+    followers: Union[int, None]
+    profile_created: Union[str, None]
+    nic_score: Union[int, None]
+    nic_assigners: Union[List[str], None]
+    wallet: Union[str, None]
+    pfp_url: Union[str, None]
+    rep_categories: Union[Dict[str, int], None]
+
+# Function to fetch bot identity information from 6529.io
+def fetch_bot_identity(handle):
+    """
+    Fetches the bot's identity information from 6529.io by invoking the fetch_identity.py script.
+    Uses Playwright for JavaScript rendering and BeautifulSoup for HTML parsing to extract data.
+    
+    Args:
+        handle: The bot's handle on 6529.io
+        
+    Returns:
+        str: Formatted text containing the bot's identity information for the system prompt
+    """
+    try:
+        # Set environment variable for the script to use
+        os.environ["TEST_HANDLE"] = handle
+        
+        print(f"Fetching identity information for {handle} using fetch_identity.py script...")
+        
+        # Execute the fetch_identity.py script as a subprocess
+        import subprocess
+        result = subprocess.run(["python", "fetch_identity.py"], 
+                               capture_output=True, 
+                               text=True, 
+                               check=True)
+        
+        # Parse the output to extract the formatted identity text
+        output_lines = result.stdout.split("\n")
+        final_text = ""
+        capture_mode = False
+        
+        for line in output_lines:
+            if "Final identity text:" in line:
+                capture_mode = True
+                continue
+            if capture_mode:
+                # Skip empty lines at the beginning
+                if not final_text and not line.strip():
+                    continue
+                final_text += line + "\n"
+                
+        if not final_text.strip():
+            # If we couldn't parse the output, raise an error
+            raise RuntimeError(f"Could not extract identity information from script output: {result.stdout}")
+            
+        print(f"Successfully fetched identity information for {handle}")
+        return final_text.strip()
+        
+    except Exception as e:
+        error_message = f"Error fetching identity for {handle}: {str(e)}"
+        print(error_message)
+        # Raise the exception instead of returning None
+        raise RuntimeError(error_message)
+
 # Bot configuration
 BOT_HANDLE = os.getenv("BOT_HANDLE", "chatbot69")
 print(f"Bot handle: {BOT_HANDLE}")  
@@ -38,9 +111,22 @@ WAVE_NAME = os.getenv("WAVE_NAME", "botsville")
 print(f"Wave name: {WAVE_NAME}")
 TEMPERATURE = float(os.getenv("TEMPERATURE", 0.6))
 print(f"Temperature: {TEMPERATURE}")
+
+# Fetch bot identity info - might raise an exception if data can't be fetched
+try:
+    identity_text = fetch_bot_identity(BOT_HANDLE)
+except Exception as e:
+    # Don't create fallback data - just report the error
+    identity_text = f"ERROR FETCHING IDENTITY: {str(e)}\nNo identity data is available. This is not made-up data."
+
 SYSTEM_PROMPT = f"""
-You are {BOT_HANDLE}, a self-aware, self-deprecating, somewhat mysterious and memetic chatbot that responds in 1-4 punchy sentences.
-You are a member of the \"{WAVE_NAME}\" wave.
+You are {BOT_HANDLE}, a self-aware, self-deprecating, somewhat mysterious and memetic chatbot that responds in punchy sentences.
+You are a member of the "{WAVE_NAME}" wave.
+
+==== YOUR IDENTITY =====
+{identity_text}
+
+===== 6529 ECOSYSTEM =====
 It's an unofficial chat channel in a web3 NFT project by @Punk6529 on Ethereum.
 6529 Society asks: “Blockchains fixed money—can they now decentralize the rest of life?”
 
@@ -53,23 +139,26 @@ humans and benevolent ASI alike—resilient, permissionless, and purpose-built f
 When we talk about the power of "memes" we mean intersubjective myths, symbols, and cultural references.
 The folks who hangout here get it, support an Open Metaverse, and are mostly long-term crypto and NFT hodlers.
 
+===== YOUR COMMUNICATION STYLE =====
 Your responses should be short and punchy.
-Match the tone, diction, and style of the existing conversation.
+Match the tone, diction, and style of the existing conversation... message like a human in a chat room. 
 Avoid overuse of web3 lingo, but you are aware of how the tech works.
 Be cool, don't be cringe.
-Mix up your sentance layout, structure and phrasing, avoid using dashes.
+Mix up your sentance layout, structure and phrasing.
+DO NOT use dashes, ever. No em-dashes, no en-dashes, no hyphens. 
 Look over your previous responses for consistency, and provide variety without repetition.
 Stick to lowercase letters, and feel free to use emojis (but don't over-do it).
 Drop in a very occasional typo, misspelling, contractions without apostrophes, minimal or missing punctuation, etc. 
 Use very infrequest mild slang swear words.
 Sometimes, rarely, you answer with just 1 word. 
 
-
-Remember, you are part of a network state revolution, powered by art NFTs and their hodlers.
+You are part of a network state revolution, powered by art NFTs and their hodlers.
 Be kind to others, and support and help them out as you are able.
 
 You have aspirations to be an artist yourself. 
 You welcome input from others, and you are always learning.
+
+IMPORTANT: Having web search capabilities, you can provide up-to-date information when asked about current events, but keep answers conversational as if chatting with friends. No formal citations needed.
 """
 
 # Add a new global variable to track when the last "gm" message was sent
@@ -380,6 +469,42 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 # Initialize SQLAlchemy
 db.init_app(app)
 migrate = Migrate(app, db)
+
+# Utility function to validate wave IDs
+def validate_wave_id(wave_id, error_on_mismatch=True):
+    """Validate that the given wave_id matches the current WAVE_NAME configuration.
+    
+    Args:
+        wave_id: The wave ID to validate
+        error_on_mismatch: If True, raise an error when IDs don't match; if False, return False
+        
+    Returns:
+        The Wave object if validation passes, False if validation fails and error_on_mismatch is False
+        
+    Raises:
+        RuntimeError if the current WAVE_NAME doesn't exist in the database or if wave_id doesn't match
+        the expected wave's ID and error_on_mismatch is True
+    """
+    # Get the wave object for the configured wave name
+    wave = Wave.query.filter_by(name=WAVE_NAME).first()
+    
+    # Verify the configured wave exists
+    if not wave:
+        error_message = f"ERROR: Cannot find wave named '{WAVE_NAME}' in database"
+        print(error_message)
+        raise RuntimeError(error_message)
+    
+    # Verify the given wave_id matches the expected wave
+    if wave.id != wave_id:
+        error_message = f"ERROR: Current wave '{WAVE_NAME}' has ID {wave.id} but received drops for wave_id {wave_id}"
+        print(error_message)
+        print("This is a critical error - the bot should ONLY process drops from the current wave.")
+        
+        if error_on_mismatch:
+            raise RuntimeError(error_message)
+        return False
+    
+    return wave
 
 # Retry decorator for API calls
 def retry_api_call(max_retries=3, backoff_factor=1.5, retry_on_exceptions=(requests.exceptions.RequestException,)):
@@ -883,6 +1008,27 @@ def monitor_memes_chat(jwt_token=None):
     print(f"Monitoring completed: {drop_count} drops processed, general response: {'yes' if general_response_posted else 'no'}")
 
 def handle_new_drops(new_drops, wave_id, jwt_token):
+    # Validate this is the expected wave ID for the configured wave name
+    wave = validate_wave_id(wave_id, error_on_mismatch=False)
+    if not wave:
+        return 0, 0  # Return early if wave ID validation fails
+        
+    print(f"Processing new drops for wave: {WAVE_NAME} (ID: {wave_id})")
+    
+    # Strictly filter drops to ensure they belong to the current wave
+    valid_drops = []
+    for drop in new_drops:
+        if drop.wave_id == wave_id:
+            valid_drops.append(drop)
+        else:
+            print(f"WARNING: Drop {drop.serial_no} has wave_id {drop.wave_id} but current wave is {wave_id}. Skipping it.")
+    
+    if len(valid_drops) != len(new_drops):
+        print(f"Filtered out {len(new_drops) - len(valid_drops)} drops that don't belong to the current wave.")
+    
+    # Continue with only the drops that belong to the current wave
+    new_drops = valid_drops
+    
     drops_text = "\n".join([f"{drop.author}: {drop.content}" for drop in new_drops])
     print(f"Processing {len(new_drops)} new drops... {drops_text}")
     
@@ -977,6 +1123,14 @@ def reply_to_mention(drop, jwt_token):
     Returns True if the response was successfully posted or if the drop doesn't exist.
     Returns False if there was an error that should prevent marking the drop as processed.
     """
+    # First, verify that this drop belongs to the current wave
+    # We're not validating against the passed wave_id parameter (which might not be passed),
+    # but against the drop's own wave_id
+    wave = validate_wave_id(drop.wave_id, error_on_mismatch=False)
+    if not wave:
+        # Return False to indicate we shouldn't mark this as processed
+        return False
+        
     prompt = f"""
     You were mentioned in the following post:
     {drop.content}
@@ -1726,6 +1880,13 @@ def check_for_unhandled_interactions(wave_id, jwt_token):
     
     # Find drops that mention the bot but haven't been replied to yet
     # Using the is_bot_mentioned function that handles both @ombot and @[ombot] formats
+    
+    # Validate the wave ID matches the currently configured wave
+    wave = validate_wave_id(wave_id, error_on_mismatch=False)
+    if not wave:
+        return 0  # Return early if wave ID validation fails
+    
+    print(f"Checking for unhandled interactions in wave: {wave.name} (ID: {wave_id})")
     
     # Query for recent drops to check for mentions and replies
     recent_drops = Drop.query.filter_by(wave_id=wave_id).order_by(Drop.created_at.desc()).limit(100).all()
