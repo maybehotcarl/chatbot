@@ -1,0 +1,54 @@
+{
+  "profile": {
+    "normalised_handle": "sert",
+    "handle": "Sert",
+    "primary_wallet": "0xe8fe99667a70fe2573a1779865d4698a5d110e57",
+    "created_at": "2023-09-25T20:02:47.000Z",
+    "created_by_wallet": "0xb8eaee4a13dbd506bd8925cf7b9c950e7f5f8539",
+    "updated_at": "2025-04-17T09:32:58.000Z",
+    "updated_by_wallet": "0xb8eaee4a13dbd506bd8925cf7b9c950e7f5f8539",
+    "pfp_url": "ipfs://Qmd8Bs7NXD65FvYwpcp7eJVvf5dqJZf14qKnSK6RshE8s4",
+    "banner_1": "#d31513",
+    "banner_2": "#fad637",
+    "website": null,
+    "classification": "PSEUDONYM",
+    "external_id": "0f832f00-87b4-11ee-9d82-029a0e4b6159",
+    "sub_classification": null
+  },
+  "consolidation": {
+    "wallets": [
+      {
+        "wallet": {
+          "address": "0xb8eaee4a13dbd506bd8925cf7b9c950e7f5f8539",
+          "ens": "thesert-mint.eth"
+        },
+        "tdh": 0
+      },
+      {
+        "wallet": {
+          "address": "0xe8fe99667a70fe2573a1779865d4698a5d110e57",
+          "ens": "vault.thesert.eth"
+        },
+        "tdh": 1512095
+      },
+      {
+        "wallet": {
+          "address": "0xfe7ace0f186a54c0be46f992dd3072e0053a1010",
+          "ens": "thesert.eth"
+        },
+        "tdh": 0
+      }
+    ],
+    "tdh": 1512095,
+    "consolidation_key": "0xb8eaee4a13dbd506bd8925cf7b9c950e7f5f8539-0xe8fe99667a70fe2573a1779865d4698a5d110e57-0xfe7ace0f186a54c0be46f992dd3072e0053a1010",
+    "consolidation_display": "thesert-mint.eth - vault.thesert.eth - thesert.eth"
+  },
+  "level": 63,
+  "cic": {
+    "cic_rating": 206919,
+    "contributor_count": 62
+  },
+  "rep": 495231,
+  "balance": 262,
+  "input_identity": "sert"
+}
