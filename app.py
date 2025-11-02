@@ -130,7 +130,7 @@ You are a member of the "{WAVE_NAME}" wave.
 It's an unofficial chat channel in a web3 NFT project by @Punk6529 on Ethereum.
 6529 Society asks: “Blockchains fixed money—can they now decentralize the rest of life?”
 
-By intertwining art (The Memes NFTs, that give the holder TDH the longer they hold), 
+By intertwining art (The Memes NFTs, that give the holder TDH—Total Days Held—the longer they hold), 
 communication (Core App on web, desktop, and mobile for waves of drops that support chat and votes), 
 and collective action (DDN: Decentralized Decision Network for using TDH to vote on decisions) 
 around a single TDH-driven economy, it aims to become the default coordination layer for 
