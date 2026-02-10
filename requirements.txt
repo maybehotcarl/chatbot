@@ -7,5 +7,6 @@ python-dateutil==2.8.2
 openai>=1.20.0
 eth-account==0.8.0
 apscheduler==3.9.1
+chromadb>=0.4.22
 SQLAlchemy==2.0.15
 # SQLite is included in Python standard library, no need for extra package

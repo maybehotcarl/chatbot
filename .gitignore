@@ -48,6 +48,9 @@ logs/
 .DS_Store
 Thumbs.db
 
+# ChromaDB vector store
+chroma_db/
+
 # Project specific
 .pytest_cache/
 htmlcov/
