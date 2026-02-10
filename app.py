@@ -1086,6 +1086,13 @@ def retrieve_author_drops(author_handle, sample_size=100, min_drops=20):
     string of their messages with timestamps, or None if fewer than min_drops.
     """
     try:
+        # Case-insensitive lookup: find the canonical handle from the DB
+        canonical = db.session.query(Drop.author).filter(
+            db.func.lower(Drop.author) == author_handle.lower()
+        ).first()
+        if canonical:
+            author_handle = canonical[0]  # use the DB's casing
+
         # Get total count for this author
         total = Drop.query.filter(
             Drop.author == author_handle,
@@ -1598,17 +1605,19 @@ def reply_to_mention(drop, jwt_token):
         if is_self_request:
             target_author = drop.author
         else:
-            # Use LLM to extract the target handle from the message
-            extract_prompt = f"""Extract the person's handle/username being asked about from this message.
-The message is from a chat where people have handles like "maybe", "david", "ricodemus", etc.
+            # Strip the bot @mention so the LLM doesn't get confused
+            cleaned_content = re.sub(rf'@\[?{re.escape(BOT_HANDLE)}\]?', '', drop.content, flags=re.IGNORECASE).strip()
+            extract_prompt = f"""Extract the person's handle/username whose personality is being asked about from this message.
+The message is from a chat where people have handles like "maybe", "david", "ricodemus", "BrynnAlise", "Zigmarillion", etc.
+IMPORTANT: The bot "{BOT_HANDLE}" is being asked to analyze someone -- do NOT return "{BOT_HANDLE}" as the target.
 Only return the bare handle (lowercase, no @), nothing else. If you can't determine a specific person, return "UNKNOWN".
 
-Message: {drop.content}"""
+Message: {cleaned_content}"""
             try:
                 extract_resp = client.responses.create(
                     model="gpt-4.1",
                     input=extract_prompt,
-                    instructions="Return only the handle, nothing else."
+                    instructions=f"Return only the handle of the person being analyzed, nothing else. Never return '{BOT_HANDLE}'."
                 )
                 parsed_handle = extract_resp.output_text.strip().lower().strip('@[]')
                 if parsed_handle and parsed_handle != "unknown":
