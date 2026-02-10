@@ -786,15 +786,16 @@ def fetch_new_drops_for_wave(wave_id, jwt_token):
                         Drop.content.isnot(None),
                         Drop.content != "",
                     ).all()
-                    # Filter out stubs
+                    # Filter out stubs and empty/whitespace-only content
                     embeddable = [
                         d for d in new_drop_records
-                        if not (d.author == "Unknown" and d.content and d.content.startswith("(Stub"))
+                        if d.content and d.content.strip()
+                        and not (d.author == "Unknown" and d.content.startswith("(Stub"))
                     ]
                     if embeddable:
                         chroma_collection.upsert(
                             ids=[d.id for d in embeddable],
-                            documents=[d.content for d in embeddable],
+                            documents=[d.content.strip() for d in embeddable],
                             metadatas=[
                                 {
                                     "author": d.author or "Unknown",
@@ -987,54 +988,181 @@ def get_recent_conversation_context(wave_id, limit=20):
 
     return "\n".join(context_lines)
 
-def retrieve_relevant_history(query_text, wave_id, n_results=10, exclude_serial_nos=None):
+def retrieve_relevant_history(query_text, wave_id, n_results=20, exclude_serial_nos=None, context_window=5):
     """
-    Query ChromaDB for drops semantically similar to query_text.
-    Returns a formatted string of relevant past conversations, or empty string on error.
+    Query ChromaDB for drops semantically similar to query_text, then expand
+    each hit by fetching surrounding drops (±context_window) from SQLite to
+    capture full conversational flow. Returns formatted string or empty on error.
     """
     try:
         if not query_text or not query_text.strip():
             return ""
 
+        # Strip @mentions and common request phrasing so semantic search
+        # focuses on the actual topic, not the "hey @Gray can you..." wrapper
+        clean_query = re.sub(r'@\[?\w+\]?', '', query_text)
+        clean_query = clean_query.strip()
+        if not clean_query:
+            clean_query = query_text  # fallback to original if stripping emptied it
+        print(f"RAG clean query: {clean_query[:80]}...")
+
         where_filter = {"wave_id": wave_id} if wave_id else None
 
         results = chroma_collection.query(
-            query_texts=[query_text],
+            query_texts=[clean_query],
             n_results=n_results + (len(exclude_serial_nos) if exclude_serial_nos else 0),
             where=where_filter,
             include=["documents", "metadatas"],
         )
 
         if not results or not results["documents"] or not results["documents"][0]:
+            print(f"RAG query returned no results for: {query_text[:80]}...")
             return ""
 
-        lines = []
+        # Collect the anchor serial numbers from RAG hits
         exclude = set(exclude_serial_nos) if exclude_serial_nos else set()
-
-        for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
+        anchor_serials = []
+        for meta in results["metadatas"][0]:
             serial = meta.get("serial_no", 0)
-            if serial in exclude:
-                continue
-            author = meta.get("author", "Unknown")
-            created_at = meta.get("created_at", "")
-            # Format timestamp nicely if available
-            if created_at:
-                try:
-                    dt = parser.isoparse(created_at)
-                    timestamp = dt.strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    timestamp = created_at[:16] if len(created_at) >= 16 else created_at
-            else:
-                timestamp = "unknown time"
-            lines.append(f"[{timestamp}] {author}: {doc}")
-
-            if len(lines) >= n_results:
+            if serial and serial not in exclude:
+                anchor_serials.append(serial)
+            if len(anchor_serials) >= n_results:
                 break
 
-        return "\n".join(lines)
+        if not anchor_serials:
+            return ""
+
+        print(f"RAG found {len(anchor_serials)} anchor drops for query: {query_text[:80]}...")
+
+        # Expand each anchor by ±context_window, fetch from SQLite
+        all_serials = set()
+        for serial in anchor_serials:
+            for offset in range(-context_window, context_window + 1):
+                s = serial + offset
+                if s > 0 and s not in exclude:
+                    all_serials.add(s)
+
+        # Fetch all expanded drops from SQLite in one query
+        expanded_drops = Drop.query.filter(
+            Drop.serial_no.in_(all_serials),
+            Drop.content.isnot(None),
+            Drop.content != "",
+        ).order_by(Drop.serial_no.asc()).all()
+
+        # Filter out stubs
+        expanded_drops = [
+            d for d in expanded_drops
+            if not (d.author == "Unknown" and d.content and d.content.startswith("(Stub"))
+        ]
+
+        # Format as lines
+        lines = []
+        for d in expanded_drops:
+            if d.created_at:
+                try:
+                    timestamp = d.created_at.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    timestamp = "unknown time"
+            else:
+                timestamp = "unknown time"
+            lines.append(f"[{timestamp}] {d.author}: {d.content}")
+
+        result_text = "\n".join(lines)
+        print(f"RAG expanded to {len(lines)} drops (from {len(anchor_serials)} anchors, ±{context_window} window)")
+        for line in lines[:10]:
+            print(f"  RAG> {line[:120]}")
+        if len(lines) > 10:
+            print(f"  RAG> ... and {len(lines) - 10} more")
+        return result_text
     except Exception as e:
         print(f"ChromaDB retrieval error (non-fatal): {e}")
         return ""
+
+
+def retrieve_author_drops(author_handle, sample_size=100, min_drops=20):
+    """
+    Query SQLite for a target author's drops, evenly sampled across their full
+    history to get a representative personality sample. Returns a formatted
+    string of their messages with timestamps, or None if fewer than min_drops.
+    """
+    try:
+        # Get total count for this author
+        total = Drop.query.filter(
+            Drop.author == author_handle,
+            Drop.content.isnot(None),
+            Drop.content != "",
+        ).count()
+
+        if total < min_drops:
+            print(f"Personality analysis: {author_handle} has only {total} drops (need {min_drops})")
+            return None
+
+        # Fetch all drop IDs ordered by time so we can evenly sample
+        all_drops = Drop.query.filter(
+            Drop.author == author_handle,
+            Drop.content.isnot(None),
+            Drop.content != "",
+        ).order_by(Drop.created_at.asc()).all()
+
+        # Evenly sample across the full history
+        if len(all_drops) <= sample_size:
+            sampled = all_drops
+        else:
+            step = len(all_drops) / sample_size
+            sampled = [all_drops[int(i * step)] for i in range(sample_size)]
+
+        # Format as timestamped lines
+        lines = []
+        for d in sampled:
+            if d.created_at:
+                try:
+                    timestamp = d.created_at.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    timestamp = "unknown time"
+            else:
+                timestamp = "unknown time"
+            lines.append(f"[{timestamp}] {d.author}: {d.content}")
+
+        print(f"Personality analysis: fetched {len(lines)} drops for {author_handle} (from {total} total)")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"Error retrieving author drops for {author_handle}: {e}")
+        return None
+
+
+def generate_personality_analysis(author_handle, sampled_messages):
+    """
+    Send sampled messages to GPT-4.1 with a personality analysis prompt.
+    Returns the analysis text in Gray's voice.
+    """
+    prompt = f"""You are analyzing the chat history of a community member named "{author_handle}" from a dive bar chat called "{WAVE_NAME}".
+
+Below is a representative sample of ~100 of their messages spread across their full history:
+
+{sampled_messages}
+
+Based on these messages, write a personality profile that includes:
+1. **Communication style & tone** -- how do they talk? Are they verbose, terse, sarcastic, earnest, chaotic?
+2. **Key interests & recurring topics** -- what do they keep coming back to?
+3. **Myers-Briggs guess** -- give your best MBTI type guess with brief reasoning for each letter
+4. **The Gray summary** -- a fun, punchy 2-3 sentence summary of this person written in the voice of a witty dive bar bartender who's been watching them for months. Not clinical, not mean -- affectionate roasting is welcome.
+
+Additional context about known community members that may help:
+{COMMUNITY_MEMBER_INFO}
+
+Keep the whole response under 300 words. Use markdown formatting sparingly (bold for MBTI type and section headers only)."""
+
+    try:
+        params = {
+            "model": "gpt-4.1",
+            "input": prompt,
+            "instructions": f"You are {BOT_HANDLE}, a witty dive bar chatbot analyzing a regular's personality. Be insightful but fun -- this is a parlor trick, not a therapy session."
+        }
+        response = client.responses.create(**params)
+        return response.output_text.strip()
+    except Exception as e:
+        print(f"Error generating personality analysis for {author_handle}: {e}")
+        return None
 
 
 def embed_all_existing_drops(wave_id):
@@ -1052,10 +1180,11 @@ def embed_all_existing_drops(wave_id):
         Drop.content != "",
     ).order_by(Drop.serial_no.asc()).all()
 
-    # Filter out stubs (author="Unknown" with stub content)
+    # Filter out stubs and drops with empty/whitespace-only content
     drops_to_embed = [
         d for d in all_drops
-        if not (d.author == "Unknown" and d.content and d.content.startswith("(Stub"))
+        if d.content and d.content.strip()
+        and not (d.author == "Unknown" and d.content.startswith("(Stub"))
     ]
 
     if not drops_to_embed:
@@ -1082,12 +1211,12 @@ def embed_all_existing_drops(wave_id):
 
     print(f"Embedding {len(new_drops)} new drops ({len(existing_ids)} already in ChromaDB)...")
 
-    # Batch embed in groups of 5000
-    batch_size = 5000
+    # Batch embed in groups of 2000 (API limit friendly)
+    batch_size = 2000
     for i in range(0, len(new_drops), batch_size):
         batch = new_drops[i:i+batch_size]
         batch_ids = [d.id for d in batch]
-        batch_documents = [d.content for d in batch]
+        batch_documents = [d.content.strip() for d in batch]
         batch_metadatas = [
             {
                 "author": d.author or "Unknown",
@@ -1455,6 +1584,54 @@ def reply_to_mention(drop, jwt_token):
             # Default to 3 hours if no specific time mentioned
             summary, actual_hours, was_limited = summarize_conversation_by_hours(drop.wave_id, 3, drop.author)
             bot_response = f"Here's what's been happening (last 3 hours): {summary}"
+    elif any(phrase in content_lower for phrase in [
+        'personality', 'myers-briggs', 'mbti', 'what am i like',
+        'what type am i', 'analyze me', 'describe me', 'what type is',
+        'personality type', 'what kind of person',
+    ]):
+        # Personality analysis / Myers-Briggs parlor trick
+        # Determine target author: "analyze me" → drop.author, "analyze maybe" → parse handle
+        self_keywords = ['analyze me', 'describe me', 'my personality', 'my type',
+                         'what am i like', 'what type am i', 'my mbti', 'my myers']
+        is_self_request = any(kw in content_lower for kw in self_keywords)
+
+        if is_self_request:
+            target_author = drop.author
+        else:
+            # Use LLM to extract the target handle from the message
+            extract_prompt = f"""Extract the person's handle/username being asked about from this message.
+The message is from a chat where people have handles like "maybe", "david", "ricodemus", etc.
+Only return the bare handle (lowercase, no @), nothing else. If you can't determine a specific person, return "UNKNOWN".
+
+Message: {drop.content}"""
+            try:
+                extract_resp = client.responses.create(
+                    model="gpt-4.1",
+                    input=extract_prompt,
+                    instructions="Return only the handle, nothing else."
+                )
+                parsed_handle = extract_resp.output_text.strip().lower().strip('@[]')
+                if parsed_handle and parsed_handle != "unknown":
+                    target_author = parsed_handle
+                else:
+                    target_author = drop.author  # fallback to requester
+            except Exception as e:
+                print(f"Error extracting personality target handle: {e}")
+                target_author = drop.author
+
+        print(f"Personality analysis requested by {drop.author} for target: {target_author}")
+
+        # Retrieve sampled drops for the target author
+        sampled_messages = retrieve_author_drops(target_author)
+
+        if sampled_messages is None:
+            bot_response = f"I don't have enough bar history on {target_author} to do a proper read yet -- need at least 20 messages to work with."
+        else:
+            analysis = generate_personality_analysis(target_author, sampled_messages)
+            if analysis:
+                bot_response = analysis
+            else:
+                bot_response = f"I tried to read {target_author}'s personality but my crystal ball glitched. Try again in a sec."
     else:
         # Regular mention response
         # Get recent conversation context for better responses
@@ -1466,7 +1643,7 @@ def reply_to_mention(drop, jwt_token):
         ).limit(20).all()
         exclude_serials = [d.serial_no for d in recent_drops if d.serial_no]
         relevant_history = retrieve_relevant_history(
-            drop.content, drop.wave_id, n_results=10, exclude_serial_nos=exclude_serials
+            drop.content, drop.wave_id, n_results=20, exclude_serial_nos=exclude_serials
         )
 
         rag_section = ""
@@ -1705,7 +1882,7 @@ def generate_general_response(drops_text, wave_id=None):
     # Retrieve relevant past conversations via RAG
     rag_section = ""
     if wave_id:
-        relevant_history = retrieve_relevant_history(drops_text, wave_id, n_results=10)
+        relevant_history = retrieve_relevant_history(drops_text, wave_id, n_results=20)
         if relevant_history:
             rag_section = f"""
 
@@ -2237,7 +2414,7 @@ def activity_check_job():
                 ])
 
                 # Retrieve relevant past conversations via RAG
-                activity_rag_history = retrieve_relevant_history(conversation_history, wave.id, n_results=10)
+                activity_rag_history = retrieve_relevant_history(conversation_history, wave.id, n_results=20)
                 activity_rag_section = ""
                 if activity_rag_history:
                     activity_rag_section = f"""
